@@ -1,0 +1,192 @@
+# =============================================================================
+# Configuration for 3D Gaussian Splatting on Microscopy Volumes
+# =============================================================================
+# Based on VolSplat approach adapted for grayscale microscopy data
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  # Intensity threshold for selecting occupied voxels (0-1, after normalization)
+  # Lower = more voxels, Higher = fewer voxels (sparser)
+  # Recommended: 0.05-0.1 for neurons, 0.1-0.2 for noisy data
+  intensity_threshold: 0.1
+  
+  # Physical voxel spacing [z, y, x] in micrometers
+  # Adjust based on your microscope settings
+  voxel_spacing: [1.0, 1.0, 1.0]
+  
+  # Normalize volume to [0, 1] range
+  normalize: true
+
+# -----------------------------------------------------------------------------
+# Gaussian Model Configuration
+# -----------------------------------------------------------------------------
+model:
+  # Initial scale of Gaussians relative to voxel size
+  # 0.5 = half voxel size, 1.0 = full voxel size
+  scale_init: 0.5
+  
+  # Minimum and maximum scale bounds (in world units)
+  scale_min: 0.001
+  scale_max: 10.0
+  
+  # Spherical harmonics degree (0 = constant color, no view-dependence)
+  # For microscopy, 0 is sufficient since there's no view-dependent effects
+  sh_degree: 0
+
+# -----------------------------------------------------------------------------
+# Optimization Configuration
+# -----------------------------------------------------------------------------
+optimization:
+  # Number of optimization iterations
+  num_iterations: 10000
+  
+  # Base learning rate
+  learning_rate: 0.01
+  
+  # Per-parameter learning rates
+  lr_means: 0.001       # Position learning rate
+  lr_scales: 0.005      # Scale learning rate
+  lr_rotations: 0.001   # Rotation learning rate
+  lr_opacities: 0.05    # Opacity learning rate
+  lr_intensity: 0.01    # Grayscale intensity learning rate
+  
+  # Learning rate scheduling
+  lr_decay_start: 500   # Start decay after this iteration
+  lr_decay_rate: 0.1    # Decay factor
+  
+  # Gradient clipping (like VolSplat's gradient_clip_val)
+  gradient_clip: 1.0
+
+# -----------------------------------------------------------------------------
+# Loss Configuration (following VolSplat)
+# -----------------------------------------------------------------------------
+loss:
+  # L1 reconstruction loss weight (primary loss)
+  lambda_l1: 0.8
+  
+  # SSIM structural similarity loss weight
+  lambda_ssim: 0.2
+  
+  # LPIPS perceptual loss weight (optional, requires lpips package)
+  # Set to 0 to disable
+  lambda_lpips: 0.0
+  lpips_apply_after_step: 100  # Start LPIPS after this iteration
+  
+  # Regularization weights
+  lambda_opacity_reg: 0.01   # Encourage sparse representation
+  lambda_scale_reg: 0.001    # Prevent very large Gaussians
+  
+  # Large error clamping (like VolSplat's clamp_large_error)
+  # Set to 0 to disable, otherwise errors > this value are ignored
+  clamp_large_error: 0.0
+
+# -----------------------------------------------------------------------------
+# Pruning Configuration
+# -----------------------------------------------------------------------------
+pruning:
+  # Enable pruning of low-opacity Gaussians
+  enabled: true
+  
+  # Prune Gaussians with opacity below this threshold
+  opacity_threshold: 0.005
+  
+  # Pruning interval (every N iterations)
+  interval: 100
+
+# -----------------------------------------------------------------------------
+# Densification Configuration (optional, disabled by default)
+# -----------------------------------------------------------------------------
+densification:
+  # Enable densification (adding new Gaussians)
+  enabled: true
+  
+  # Gradient threshold for densification (lower = more densification)
+  # If Gaussians have high positional gradients, they need to be split/cloned
+  grad_threshold: 0.0002
+  
+  # Densification interval (every N iterations)
+  interval: 200
+  
+  # Start densification after this iteration (allow initial settling)
+  start_iter: 200
+  
+  # Stop densification after this iteration (typically 50-70% of total iters)
+  until_iter: 5000
+  
+  # Maximum number of Gaussians (prevents OOM)
+  max_gaussians: 5000
+
+# -----------------------------------------------------------------------------
+# Output Configuration
+# -----------------------------------------------------------------------------
+output:
+  # Save interval (every N iterations) - saves model checkpoints
+  save_interval: 500
+  
+  # Log interval (print progress every N iterations)
+  log_interval: 10
+  
+  # MIP comparison save interval (0 to disable)
+  mip_interval: 500
+  
+  # Output formats
+  save_ply: true    # Save PLY for visualization
+  save_npz: true    # Save NPZ with full model data
+  
+  # Output directory (relative to input file or absolute)
+  output_dir: "output"
+
+# -----------------------------------------------------------------------------
+# Rendering Configuration
+# -----------------------------------------------------------------------------
+rendering:
+  # Batch size for volume rendering (reduce if out of memory)
+  batch_size: 1024
+  
+  # Use sparse evaluation (faster, only at non-empty voxels)
+  use_sparse_loss: true
+  
+  # Number of slices for SSIM computation (for efficiency)
+  ssim_num_slices: 8
+  
+  # Compute SSIM every N iterations (for efficiency)
+  ssim_compute_interval: 10
+  
+  # Max Gaussians to consider per query point
+  max_gaussians_per_point: 64
+
+# -----------------------------------------------------------------------------
+# Device Configuration
+# -----------------------------------------------------------------------------
+device:
+  # Device to use: "cuda", "cpu", or "auto"
+  type: "auto"
+  
+  # Mixed precision (float16) - faster but less precise
+  mixed_precision: false
+
+# -----------------------------------------------------------------------------
+# Demo Configuration (for synthetic test data)
+# -----------------------------------------------------------------------------
+demo:
+  # Volume size for synthetic demo
+  volume_size: 48
+  
+  # Soma (cell body) parameters
+  soma_intensity: 0.8
+  soma_sigma: 6.0
+  
+  # Dendrite parameters
+  dendrite_intensity: 0.6
+  dendrite_sigma: 15.0
+  
+  # Noise standard deviation
+  noise_std: 0.03
+  
+  # Default threshold for demo (if not specified)
+  default_threshold: 0.05
+  
+  # Default iterations for demo
+  default_iterations: 300
