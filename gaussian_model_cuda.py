@@ -685,13 +685,25 @@ class CUDAGaussianModel(nn.Module):
         children_int = []
         children_op = []
 
+        # Precompute intensity adjustment for sigmoid activation
+        # For sigmoid: to divide output by n_split, we need new_raw = logit(sigmoid(raw)/n)
+        if self.intensity_activation == "sigmoid":
+            current_intensity = torch.sigmoid(inten_raw)
+            target_intensity = current_intensity / n_split
+            target_intensity = target_intensity.clamp(1e-6, 1 - 1e-6)  # avoid logit explosion
+            # logit = log(p / (1-p))
+            new_inten_raw = torch.log(target_intensity / (1 - target_intensity))
+        else:
+            # For softplus/linear: subtracting log(n) approximately divides output
+            new_inten_raw = inten_raw - np.log(n_split + 1e-6)
+
         for _ in range(n_split):
             # perturb in raw-position space
             children_pos.append(pos_raw + torch.randn_like(pos_raw) * 0.08)
             # reduce scale (in raw scale space, we approximate by subtracting a constant)
             children_sc.append(sc_raw - np.log(n_split + 1e-6))
             children_rot.append(rot.clone())
-            children_int.append(inten_raw - np.log(n_split + 1e-6))
+            children_int.append(new_inten_raw.clone())
             children_op.append(op_raw.clone())
 
         new_pos_raw = torch.cat(children_pos, dim=0)
