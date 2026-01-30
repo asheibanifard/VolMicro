@@ -144,3 +144,6 @@ Thumbs.db
 *.temp
 .temp/
 tmp/
+*.tif
+*.pt
+output/
