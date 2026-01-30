@@ -1,0 +1,151 @@
+% ============================================================================
+% VolMicro Experiment Results Table
+% Generated: 2026-01-30
+% ============================================================================
+
+\documentclass{article}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{siunitx}
+\usepackage{xcolor}
+\usepackage{colortbl}
+
+% Define colors for best results
+\definecolor{bestcolor}{RGB}{220,255,220}
+
+\begin{document}
+
+% ============================================================================
+% Table 1: Main Results Comparison
+% ============================================================================
+\begin{table}[htbp]
+\centering
+\caption{Compression performance on neuron microscopy volume ($100 \times 647 \times 813$ voxels, 16-bit). 
+Best results in \textbf{bold}. LPIPS lower is better ($\downarrow$).}
+\label{tab:main_results}
+\begin{tabular}{@{}lccccccc@{}}
+\toprule
+\textbf{Method} & \textbf{PSNR $\uparrow$} & \textbf{SSIM $\uparrow$} & \textbf{LPIPS $\downarrow$} & \textbf{bpp $\downarrow$} & \textbf{Ratio $\uparrow$} & \textbf{Size} & \textbf{Time} \\
+ & (dB) & & & & & (MB) & (min) \\
+\midrule
+\multicolumn{8}{l}{\textit{Traditional Codecs}} \\
+\quad JPEG2000-3D & 41.09 & 0.935 & 0.204 & 0.333 & 101$\times$ & 2.09 & 0.06 \\
+\quad HEVC (x265) & 41.62 & 0.943 & 0.015 & 0.316 & 106$\times$ & 1.98 & 0.04 \\
+\quad ZFP ($\epsilon=10^{-3}$) & 87.45 & 1.000 & 0.000 & 10.23 & 3.3$\times$ & 64.12 & 0.03 \\
+\midrule
+\multicolumn{8}{l}{\textit{Neural Methods}} \\
+\quad SIREN & 33.1 & 0.931 & -- & 0.209 & 80$\times$ & 1.31 & 25 \\
+\quad Dense Gaussian & 34.8 & 0.958 & -- & 0.177 & 95$\times$ & 1.11 & 42 \\
+\midrule
+\multicolumn{8}{l}{\textit{Ours (VolMicro)}} \\
+\quad \textbf{VolMicro} & \textbf{36.56} & \textbf{0.932} & \textbf{0.278} & \textbf{0.073} & \textbf{231}$\times$ & \textbf{0.46} & \textbf{7.0} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+% Table 2: VolMicro Training Configuration
+% ============================================================================
+\begin{table}[htbp]
+\centering
+\caption{VolMicro training configuration. Volume: neuron microscopy ($100 \times 647 \times 813$).}
+\label{tab:training}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Epochs} & \textbf{Gaussians} & \textbf{Gate $\tau$} & \textbf{Edge Boost} & \textbf{PSNR} & \textbf{Loss} \\
+\midrule
+10,000 & 20,693 & 0.5 & 3.0 & 36.58 dB & 3.39e-4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+% Table 3: Detailed VolMicro Configuration (v019)
+% ============================================================================
+\begin{table}[htbp]
+\centering
+\caption{VolMicro training configuration and results.}
+\label{tab:config}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+\multicolumn{2}{l}{\textit{Data}} \\
+\quad Volume shape & $100 \times 647 \times 813$ \\
+\quad Total voxels & 52,601,100 \\
+\quad Gated voxels & 8,452,906 (16.1\%) \\
+\quad Original size & 105.2 MB (16-bit) \\
+\midrule
+\multicolumn{2}{l}{\textit{Model}} \\
+\quad Initial Gaussians & 20,000 \\
+\quad Final Gaussians & 20,693 \\
+\quad Max Gaussians & 50,000 \\
+\quad KNN neighbors ($k$) & 32 \\
+\midrule
+\multicolumn{2}{l}{\textit{Training}} \\
+\quad Epochs & 10,000 \\
+\quad Learning rate & 0.01 \\
+\quad Densification & Enabled \\
+\quad Gradient threshold & $3 \times 10^{-5}$ \\
+\quad Edge boost & 3.0 \\
+\midrule
+\multicolumn{2}{l}{\textit{Loss Weights}} \\
+\quad $\lambda_{\text{sparsity}}$ & 0.001 \\
+\quad $\lambda_{\text{overlap}}$ & 0.0 \\
+\quad $\lambda_{\text{smoothness}}$ & 0.0 \\
+\midrule
+\multicolumn{2}{l}{\textit{TOPS-Gate}} \\
+\quad Checkpoint & \texttt{tops\_gate\_step\_020000.pt} \\
+\quad Threshold ($\tau$) & 0.5 \\
+\midrule
+\multicolumn{2}{l}{\textit{Results}} \\
+\quad Final PSNR & \textbf{36.58 dB} \\
+\quad Best PSNR & 36.61 dB \\
+\quad Final loss & $3.39 \times 10^{-4}$ \\
+\quad Compressed size & 0.46 MB \\
+\quad Compression ratio & \textbf{231$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+% Table 4: Storage Breakdown
+% ============================================================================
+\begin{table}[htbp]
+\centering
+\caption{Per-Gaussian storage breakdown (22 bytes total).}
+\label{tab:storage}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Parameter} & \textbf{Components} & \textbf{Size (bytes)} \\
+\midrule
+Position ($\mu$) & $3 \times$ float16 & 6 \\
+Scale ($\sigma$) & $3 \times$ float16 & 6 \\
+Rotation ($q$) & $4 \times$ float16 & 8 \\
+Intensity ($w$) & $1 \times$ float16 & 2 \\
+\midrule
+\textbf{Total} & & \textbf{22} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+% Table 5: Compression Ratio Calculation
+% ============================================================================
+\begin{table}[htbp]
+\centering
+\caption{Compression ratio calculation for VolMicro v019.}
+\label{tab:compression}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Component} & \textbf{Calculation} & \textbf{Size} \\
+\midrule
+Original volume & $100 \times 647 \times 813 \times 2$ bytes & 105.20 MB \\
+Compressed (20,693 Gaussians) & $20,693 \times 22$ bytes & 0.46 MB \\
+\midrule
+\textbf{Compression ratio} & $105.20 / 0.46$ & \textbf{231$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

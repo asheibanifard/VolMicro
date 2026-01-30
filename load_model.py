@@ -60,6 +60,19 @@ def load_model(checkpoint_path: str, volume_shape: tuple = None, device: str = '
     # Load state dict
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
+    elif 'model_params' in checkpoint:
+        # New checkpoint format: model_params contains both metadata and tensors
+        params = checkpoint['model_params']
+        state_dict = {
+            'positions_raw': params['positions_raw'],
+            'scales_raw': params['scales_raw'],
+            'rotations': params['rotations'],
+            'intensities_raw': params['intensities_raw'],
+        }
+        # Handle grid_points if it exists in model but not in checkpoint
+        if hasattr(model, 'grid_points') and 'grid_points' not in state_dict:
+            state_dict['grid_points'] = model.grid_points
+        model.load_state_dict(state_dict, strict=False)
     else:
         model.load_state_dict(checkpoint)
     

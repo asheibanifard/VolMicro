@@ -1,0 +1,46 @@
+{
+  "version": "v019",
+  "timestamp": "2026-01-30T14:08:45.879011",
+  "args": {
+    "volume": "/workspace/VolMicro/10-2900-control-cell-05_cropped_corrected.tif",
+    "gate_checkpoint": "/workspace/VolMicro/tops_gate_step_020000.pt",
+    "gate_tau": 0.5,
+    "num_gaussians": 20000,
+    "epochs": 10000,
+    "lr": 0.01,
+    "densify": true,
+    "max_gaussians": 50000,
+    "eval_interval": 10,
+    "save_interval": 500,
+    "use_sampling": true,
+    "num_samples": 0,
+    "knn_k": 32,
+    "lambda_sparsity": 0.001,
+    "lambda_overlap": 0.0,
+    "lambda_smoothness": 0.0,
+    "smoothness_neighbors": 5,
+    "edge_boost": 3.0,
+    "use_edge_weights": true,
+    "grad_threshold": 3e-05
+  },
+  "data": {
+    "volume_shape": [
+      100,
+      647,
+      813
+    ],
+    "total_voxels": 52601100,
+    "gated_voxels": 8452906,
+    "gate_occupancy_pct": 16.069827437068806
+  },
+  "results": {
+    "final_psnr": 36.575782775878906,
+    "final_ssim": null,
+    "final_lpips": null,
+    "final_loss": 0.00033938593696802855,
+    "final_gaussians": 20693,
+    "best_psnr": 36.61467742919922,
+    "best_ssim": null,
+    "best_lpips": null
+  }
+}
