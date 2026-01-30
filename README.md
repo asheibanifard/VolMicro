@@ -25,12 +25,17 @@ Our method represents microscopy volumes as sparse collections of anisotropic 3D
 
 ### Performance
 
+Benchmark on neuron microscopy volume (100 × 647 × 813 voxels, 16-bit):
+
 | Metric | Result |
 |--------|--------|
-| **PSNR** | >35 dB |
-| **SSIM** | >0.96 |
-| **Compression Ratio** | >120× |
-| **Decode Time** | ~1.5 s |
+| **PSNR** | 36.56 dB |
+| **SSIM** | 0.932 |
+| **LPIPS** | 0.278 |
+| **Compression Ratio** | 231× |
+| **bpp** | 0.073 |
+| **Model Size** | 0.46 MB (20,693 Gaussians) |
+| **Training Time** | 7 min (10K epochs) |
 
 ---
 
@@ -84,6 +89,42 @@ pip install -r requirements.txt
 - CUDA ≥ 11.0 (for GPU acceleration)
 - FAISS (for KNN acceleration)
 - NumPy, tifffile, PyYAML
+
+---
+
+## Pretrained Models
+
+Download pretrained models from HuggingFace:
+
+```bash
+# Install huggingface-hub if needed
+pip install huggingface-hub
+
+# Download all pretrained models
+huggingface-cli download Arminshfard/volmicro-checkpoints --local-dir ./pretrained_models
+```
+
+Or download directly from: 🤗 [Arminshfard/volmicro-checkpoints](https://huggingface.co/Arminshfard/volmicro-checkpoints)
+
+### Available Models
+
+| Model | Gaussians | PSNR | Compression | Description |
+|-------|-----------|------|-------------|-------------|
+| `v019` | 20,693 | 36.56 dB | 231× | Best quality, 10K epochs |
+| `v014` | -- | -- | -- | Ablation study |
+
+### Quick Inference
+
+```python
+from load_model import load_checkpoint
+
+# Load pretrained model
+model = load_checkpoint('pretrained_models/v019/checkpoints/checkpoint_epoch_010000.pt')
+
+# Reconstruct volume
+volume = model.forward_knn_volume(k=32)
+print(f"Reconstructed: {volume.shape}")  # (100, 647, 813)
+```
 
 ---
 
@@ -144,22 +185,26 @@ The compressed representation stores per-Gaussian parameters:
 | Intensity | 1 × float16 = 2 bytes |
 | **Total** | **22 bytes per Gaussian** |
 
-**Example**: A 512³ volume (256 MB at 16-bit) with 50,000 Gaussians:
+**Example**: Neuron microscopy volume (100 × 647 × 813, 105 MB at 16-bit) with 20,693 Gaussians:
 
-$$\text{Compression ratio} = \frac{512^3 \times 2}{50000 \times 22} = \frac{268\text{ MB}}{1.1\text{ MB}} \approx 244\times$$
+$$\text{Compression ratio} = \frac{105.2\text{ MB}}{20693 \times 22\text{ bytes}} = \frac{105.2\text{ MB}}{0.46\text{ MB}} \approx 231\times$$
 
 ---
 
 ## Comparison with Baselines
 
-| Method | PSNR ↑ | SSIM ↑ | Ratio ↑ | Encode | Decode |
-|--------|--------|--------|---------|--------|--------|
-| JPEG2000-3D | 31.2 dB | 0.912 | 25× | 12 s | 8 s |
-| HEVC (x265) | 29.8 dB | 0.889 | 40× | 45 s | 3 s |
-| ZFP (1e-3) | 34.5 dB | 0.948 | 12× | 2 s | 1 s |
-| SIREN | 33.1 dB | 0.931 | 80× | 25 min | 45 s |
-| Dense Gaussian | 34.8 dB | 0.958 | 95× | 42 min | 2 s |
-| **VolMicro (Ours)** | **35.6 dB** | **0.967** | **124×** | **7 min** | **1.5 s** |
+Benchmark on neuron microscopy volume (100 × 647 × 813 voxels, 16-bit, 105 MB):
+
+| Method | PSNR ↑ | SSIM ↑ | LPIPS ↓ | bpp ↓ | Ratio ↑ | Size | Time |
+|--------|--------|--------|---------|-------|---------|------|------|
+| JPEG2000-3D | 41.09 dB | 0.935 | 0.204 | 0.333 | 101× | 2.09 MB | 0.06 min |
+| HEVC (x265) | 41.62 dB | 0.943 | 0.015 | 0.316 | 106× | 1.98 MB | 0.04 min |
+| ZFP (ε=10⁻³) | 87.45 dB | 1.000 | 0.000 | 10.23 | 3.3× | 64.12 MB | 0.03 min |
+| SIREN | 33.1 dB | 0.931 | -- | 0.209 | 80× | 1.31 MB | 25 min |
+| Dense Gaussian | 34.8 dB | 0.958 | -- | 0.177 | 95× | 1.11 MB | 42 min |
+| **VolMicro (Ours)** | **36.56 dB** | **0.932** | **0.278** | **0.073** | **231×** | **0.46 MB** | **7 min** |
+
+> **Note**: PSNR/SSIM computed on gated (foreground) region. ZFP achieves near-lossless quality but at 70× larger size than VolMicro. Traditional codecs (JPEG2000, HEVC) have higher PSNR but worse compression ratios.
 
 ---
 
