@@ -178,15 +178,15 @@ class SparseTrainerConfig:
     lambda_smoothness: float = 0.0  # Smoothness regularization (0 = disabled)
     smoothness_neighbors: int = 5  # k-NN for smoothness
     knn_k: int = 80  # More neighbors for higher accuracy (was 48)
-    densify_grad_threshold: float = 0.00005  # Lower = more densification
-    densify_scale_threshold: float = 0.002  # Clone very small (<0.002), split larger
+    densify_grad_threshold: float = 0.0005  # Higher = less aggressive densification
+    densify_scale_threshold: float = 0.005  # Clone small (<0.005), split large (>0.005)
     densify_interval: int = 200  # More frequent densification
     densify_start: int = 200  # Start earlier
     densify_stop: int = 5000  # Continue longer for refinement
     max_gaussians: int = 100000  # More Gaussians for fine structures
-    # Pruning thresholds (aggressive to remove halos)
+    # Pruning thresholds (aggressive)
     prune_intensity_threshold: float = 0.02  # Prune if intensity < 2% (sigmoid output)
-    prune_scale_threshold: float = 0.02  # Prune if max scale > 2% of volume (remove halos)
+    prune_scale_threshold: float = 0.05  # Prune if max scale > 5% of volume (too large)
     # Edge-aware loss settings
     use_edge_weights: bool = True  # Weight loss higher on edges
     edge_boost: float = 3.0  # How much to boost edge regions
