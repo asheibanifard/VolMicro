@@ -1,0 +1,59 @@
+# VolMicro - Gaussian-based Volume Compression
+# Conda Environment Configuration
+# 
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate volmicro
+#
+# Note: simple_knn and fused_ssim are CUDA extensions built from source
+
+name: volmicro
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  
+  # ============ Numerical Computing ============
+  - numpy=2.2.6
+  - scipy=1.15.2
+  
+  # ============ Image I/O ============
+  - tifffile=2025.5.10
+  - imageio=2.9.0
+  - pillow=12.0.0
+  
+  # ============ Progress & Utilities ============
+  - tqdm=4.67.1
+  - pyyaml=6.0.3
+  
+  # ============ Visualization ============
+  - matplotlib=3.10.8
+  
+  # ============ Jupyter Support ============
+  - jupyter=1.0.0
+  - ipykernel=6.0.0
+  - jupyterlab
+  
+  # ============ Pip Packages ============
+  - pip
+  - pip:
+      # PyTorch with CUDA 12.6 (from PyTorch index)
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - torch==2.10.0+cu126
+      - torchvision==0.25.0+cu126
+      - triton==3.6.0
+      
+      # SSIM/Perceptual losses
+      - pytorch-msssim==1.0.0
+      - lpips==0.1.4
+      
+      # CUDA-accelerated 3DGS utilities (built from source)
+      - simple_knn @ git+https://gitlab.inria.fr/bkerbl/simple-knn.git@86710c2d4b46680c02301765dd79e465819c8f19
+      - fused-ssim @ git+https://github.com/rahul-goel/fused-ssim.git@0ac916a05f48f8e477dc8ce1651a346b65ce2072
+      
+      # Optional: GPU-accelerated similarity search (requires numpy<2)
+      # - faiss-cpu==1.7.4

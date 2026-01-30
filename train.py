@@ -178,12 +178,15 @@ class SparseTrainerConfig:
     lambda_smoothness: float = 0.0  # Smoothness regularization (0 = disabled)
     smoothness_neighbors: int = 5  # k-NN for smoothness
     knn_k: int = 80  # More neighbors for higher accuracy (was 48)
-    densify_grad_threshold: float = 0.0001  # Reasonable threshold for gradient-based densification
-    densify_scale_threshold: float = 0.01  # Clone small (<0.01), split large (>0.01)
+    densify_grad_threshold: float = 0.00005  # Lower = more densification
+    densify_scale_threshold: float = 0.002  # Clone very small (<0.002), split larger
     densify_interval: int = 200  # More frequent densification
     densify_start: int = 200  # Start earlier
     densify_stop: int = 5000  # Continue longer for refinement
     max_gaussians: int = 100000  # More Gaussians for fine structures
+    # Pruning thresholds (aggressive to remove halos)
+    prune_intensity_threshold: float = 0.02  # Prune if intensity < 2% (sigmoid output)
+    prune_scale_threshold: float = 0.02  # Prune if max scale > 2% of volume (remove halos)
     # Edge-aware loss settings
     use_edge_weights: bool = True  # Weight loss higher on edges
     edge_boost: float = 3.0  # How much to boost edge regions
@@ -201,11 +204,13 @@ class SparseGateGuidedTrainer:
         volume: torch.Tensor,
         gate_mask: torch.Tensor,
         config: SparseTrainerConfig,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        output_dir: str = None
     ):
         self.model = model
         self.device = device
         self.config = config
+        self.output_dir = output_dir  # Output checkpoint folder
         
         # Volume
         self.volume = volume.to(device)
@@ -522,8 +527,8 @@ class SparseGateGuidedTrainer:
         
         # Prune low-contribution or excessively large Gaussians
         n_prune = self.model.prune_gaussians(
-            intensity_threshold=0.001,  # Less aggressive: keep more low-intensity Gaussians
-            scale_threshold=1.0         # Less aggressive: allow larger Gaussians
+            intensity_threshold=cfg.prune_intensity_threshold,
+            scale_threshold=cfg.prune_scale_threshold
         )
         
         print(f"                   clone={n_clone}, split={n_split}, prune={n_prune}, N: {N_before} -> {self.model.N}")
@@ -617,21 +622,9 @@ class SparseGateGuidedTrainer:
                 psnr = self.compute_psnr_sparse()
                 self.history['psnr'].append(psnr)
                 
-                # Compute SSIM and LPIPS less frequently (expensive)
-                if epoch % (eval_interval * 10) == 0:
-                    ssim_val = self.compute_ssim_mip()
-                    lpips_val = self.compute_lpips_mip()
-                    self.history['ssim'].append(ssim_val)
-                    self.history['lpips'].append(lpips_val)
-                    pbar.set_postfix({
-                        'loss': f'{total_loss.item():.6f}',
-                        'psnr': f'{psnr:.2f}',
-                        'ssim': f'{ssim_val:.4f}',
-                        'lpips': f'{lpips_val:.4f}',
-                        'N': self.model.N
-                    })
-                else:
-                    pbar.set_postfix({
+                # SSIM/LPIPS disabled - too slow for large volumes
+                # Only compute at final epoch if needed
+                pbar.set_postfix({
                         'loss': f'{total_loss.item():.6f}',
                         'psnr': f'{psnr:.2f}',
                         'N': self.model.N
@@ -640,17 +633,62 @@ class SparseGateGuidedTrainer:
             if save_dir and save_interval > 0 and (epoch + 1) % save_interval == 0:
                 self.save_checkpoint(save_dir, epoch + 1)
         
+        # Save final checkpoint
+        if save_dir:
+            self.save_checkpoint(save_dir, num_epochs, is_final=True)
+        
         return self.history
     
-    def save_checkpoint(self, save_dir: str, epoch: int):
+    def save_checkpoint(self, save_dir: str, epoch: int, is_final: bool = False):
         checkpoint = {
             'epoch': epoch,
             'model_params': self.model.get_parameters_dict(),
             'optimizer_state': self.optimizer.state_dict(),
             'history': self.history,
+            'config': {
+                'learning_rate': self.config.learning_rate,
+                'lambda_sparsity': self.config.lambda_sparsity,
+                'lambda_overlap': self.config.lambda_overlap,
+                'lambda_smoothness': self.config.lambda_smoothness,
+                'knn_k': self.config.knn_k,
+                'densify_grad_threshold': self.config.densify_grad_threshold,
+                'densify_scale_threshold': self.config.densify_scale_threshold,
+                'prune_intensity_threshold': self.config.prune_intensity_threshold,
+                'prune_scale_threshold': self.config.prune_scale_threshold,
+                'max_gaussians': self.config.max_gaussians,
+            },
+            'output_dir': self.output_dir,
         }
-        path = os.path.join(save_dir, f'checkpoint_epoch_{epoch:06d}.pt')
+        
+        if is_final:
+            path = os.path.join(save_dir, 'checkpoint_final.pt')
+        else:
+            path = os.path.join(save_dir, f'checkpoint_epoch_{epoch:06d}.pt')
+        
         torch.save(checkpoint, path)
+        
+        # Also save a compact .ply-like format for visualization
+        if is_final:
+            self._save_gaussians_compact(save_dir)
+    
+    def _save_gaussians_compact(self, save_dir: str):
+        """Save Gaussians in a compact format for visualization."""
+        import json
+        
+        with torch.no_grad():
+            data = {
+                'num_gaussians': self.model.N,
+                'volume_shape': list(self.model.volume_shape),
+                'positions': self.model.positions.cpu().numpy().tolist(),
+                'scales': self.model.scales.cpu().numpy().tolist(),
+                'rotations': self.model.rotations.cpu().numpy().tolist(),
+                'intensities': self.model.intensities().cpu().numpy().tolist(),
+            }
+        
+        path = os.path.join(save_dir, 'gaussians.json')
+        with open(path, 'w') as f:
+            json.dump(data, f)
+        print(f"Saved Gaussians to {path}")
     
     def reconstruct_full_volume(self):
         """Reconstruct full volume for visualization/saving."""
@@ -672,7 +710,8 @@ def main():
     parser.add_argument('--eval_interval', type=int, default=10, help='PSNR eval interval')
     parser.add_argument('--save_interval', type=int, default=500, help='Checkpoint save interval')
     parser.add_argument('--use_sampling', action='store_true', help='Sample from gated voxels (faster)')
-    parser.add_argument('--num_samples', type=int, default=500000, help='Samples per iteration')
+    parser.add_argument('--sample_ratio', type=float, default=0.2, help='Fraction of gated voxels to sample (0.2 = 20%)')
+    parser.add_argument('--num_samples', type=int, default=0, help='Fixed samples per iteration (0 = use sample_ratio instead)')
     parser.add_argument('--knn_k', type=int, default=32, help='K nearest Gaussians per query (lower=faster, higher=more accurate)')
     parser.add_argument('--lambda_sparsity', type=float, default=0.001, help='Sparsity regularization weight')
     parser.add_argument('--lambda_overlap', type=float, default=0.0, help='Overlap regularization weight (0=disabled)')
@@ -684,10 +723,32 @@ def main():
     
     args = parser.parse_args()
     device = 'cuda'
-    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Create versioned output directory
+    base_output_dir = args.output_dir
+    os.makedirs(base_output_dir, exist_ok=True)
+    
+    # Find next version number
+    existing_versions = [d for d in os.listdir(base_output_dir) 
+                        if os.path.isdir(os.path.join(base_output_dir, d)) and d.startswith('v')]
+    if existing_versions:
+        version_nums = []
+        for v in existing_versions:
+            try:
+                version_nums.append(int(v[1:]))
+            except ValueError:
+                pass
+        next_version = max(version_nums) + 1 if version_nums else 1
+    else:
+        next_version = 1
+    
+    version_dir = os.path.join(base_output_dir, f'v{next_version:03d}')
+    os.makedirs(version_dir, exist_ok=True)
+    args.output_dir = version_dir
     
     print("=" * 60)
     print("Sparse Gate-Guided Gaussian Training")
+    print(f"Output: {version_dir}")
     print("=" * 60)
     
     # Load volume
@@ -765,21 +826,32 @@ def main():
         volume=volume_tensor,
         gate_mask=gate_mask,
         config=config,
-        device=device
+        device=device,
+        output_dir=args.output_dir
     )
+    
+    # Compute num_samples from ratio if not specified
+    if args.use_sampling:
+        if args.num_samples > 0:
+            num_samples = args.num_samples
+        else:
+            num_samples = int(n_gated * args.sample_ratio)
+        print(f"\nSampling {args.sample_ratio*100:.0f}% of gated voxels = {num_samples:,} samples/epoch")
+    else:
+        num_samples = n_gated  # Use all
     
     # Train
     print(f"\nStarting SPARSE training...")
     print(f"  Epochs: {args.epochs}")
     print(f"  Using sampling: {args.use_sampling}")
     if args.use_sampling:
-        print(f"  Samples per iter: {args.num_samples:,}")
+        print(f"  Samples per iter: {num_samples:,} ({args.sample_ratio*100:.0f}% of {n_gated:,} gated voxels)")
     print(f"  Loss weights: sparsity={args.lambda_sparsity}, overlap={args.lambda_overlap}, smoothness={args.lambda_smoothness}")
     
     history = trainer.train(
         num_epochs=args.epochs,
         use_sampling=args.use_sampling,
-        num_samples=args.num_samples,
+        num_samples=num_samples,
         eval_interval=args.eval_interval,
         save_interval=args.save_interval,
         save_dir=os.path.join(args.output_dir, 'checkpoints'),
@@ -801,6 +873,54 @@ def main():
     # History
     with open(os.path.join(args.output_dir, 'history.json'), 'w') as f:
         json.dump(history, f, indent=2)
+    
+    # Save training configuration and parameters
+    from datetime import datetime
+    config_log = {
+        'version': f'v{next_version:03d}',
+        'timestamp': datetime.now().isoformat(),
+        'args': {
+            'volume': args.volume,
+            'gate_checkpoint': args.gate_checkpoint,
+            'gate_tau': args.gate_tau,
+            'num_gaussians': args.num_gaussians,
+            'epochs': args.epochs,
+            'lr': args.lr,
+            'densify': args.densify,
+            'max_gaussians': args.max_gaussians,
+            'eval_interval': args.eval_interval,
+            'save_interval': args.save_interval,
+            'use_sampling': args.use_sampling,
+            'num_samples': args.num_samples,
+            'knn_k': args.knn_k,
+            'lambda_sparsity': args.lambda_sparsity,
+            'lambda_overlap': args.lambda_overlap,
+            'lambda_smoothness': args.lambda_smoothness,
+            'smoothness_neighbors': args.smoothness_neighbors,
+            'edge_boost': args.edge_boost,
+            'use_edge_weights': not args.no_edge_weights,
+            'grad_threshold': args.grad_threshold,
+        },
+        'data': {
+            'volume_shape': list(volume_shape),
+            'total_voxels': int(total_voxels),
+            'gated_voxels': int(n_gated),
+            'gate_occupancy_pct': float(100 * n_gated / total_voxels),
+        },
+        'results': {
+            'final_psnr': history['psnr'][-1] if history['psnr'] else None,
+            'final_ssim': history['ssim'][-1] if history['ssim'] else None,
+            'final_lpips': history['lpips'][-1] if history['lpips'] else None,
+            'final_loss': history['total_loss'][-1] if history['total_loss'] else None,
+            'final_gaussians': model.N,
+            'best_psnr': max(history['psnr']) if history['psnr'] else None,
+            'best_ssim': max(history['ssim']) if history['ssim'] else None,
+            'best_lpips': min(history['lpips']) if history['lpips'] else None,
+        }
+    }
+    
+    with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
+        json.dump(config_log, f, indent=2)
     
     # Summary
     print("\n" + "=" * 60)

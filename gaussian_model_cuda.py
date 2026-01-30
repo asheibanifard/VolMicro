@@ -66,7 +66,6 @@ class CUDAGaussianModel(nn.Module):
         init_method: str = "uniform", # "uniform", "grid", or "swc"
         device: str = "cuda",
         intensity_activation: str = "sigmoid",  # "sigmoid" | "softplus" | "linear"
-        init_opacity: float = 0.1,    # used only for 3DGS-style export
         swc_path: str = None,         # path to SWC file for skeleton initialization
         swc_densify: bool = True,     # densify skeleton points
     ):
@@ -132,12 +131,6 @@ class CUDAGaussianModel(nn.Module):
         # ----- intensities (raw); activation applied consistently everywhere -----
         intensities_raw = torch.randn(self.N, device=device) * 0.1
         self.intensities_raw = nn.Parameter(intensities_raw)  # (N,)
-
-        # ----- opacities for 3DGS export (optional, but kept consistent) -----
-        # raw_opacity init = inverse sigmoid(init_opacity)
-        init_opacity = float(np.clip(init_opacity, 1e-4, 1 - 1e-4))
-        raw_op = np.log(init_opacity) - np.log(1 - init_opacity)
-        self.raw_opacities = nn.Parameter(torch.full((self.N,), raw_op, device=device))
 
         # FAISS index cache (rebuilt periodically, not every iteration)
         self._faiss_index = None
@@ -221,11 +214,6 @@ class CUDAGaussianModel(nn.Module):
         # (N,3) > 0
         return F.softplus(self.scales_raw) + 1e-6
 
-    @property
-    def opacities(self) -> torch.Tensor:
-        # (N,) in (0,1)
-        return torch.sigmoid(self.raw_opacities)
-
     def intensities(self) -> torch.Tensor:
         # Consistent activation for CUDA + export
         if self.intensity_activation == "sigmoid":
@@ -306,7 +294,6 @@ class CUDAGaussianModel(nn.Module):
             "positions": self.positions,                                 # (N,3) in (0,1)
             "scales": self.scales,                                       # (N,3) > 0
             "rotations": F.normalize(self.rotations, dim=1),              # (N,4)
-            "opacities": self.opacities.unsqueeze(-1),                   # (N,1)
             "intensities": self.intensities().unsqueeze(-1),             # (N,1)
         }
 
@@ -323,7 +310,6 @@ class CUDAGaussianModel(nn.Module):
             "scales_raw": self.scales_raw.data,
             "rotations": self.rotations.data,
             "intensities_raw": self.intensities_raw.data,
-            "raw_opacities": self.raw_opacities.data,
         }
 
     # -------------------- CUDA evaluation --------------------
@@ -627,13 +613,12 @@ class CUDAGaussianModel(nn.Module):
     # -------------------- topology edits (densify/clone/split/prune) --------------------
     # IMPORTANT: after any of these, you should re-create your optimiser because nn.Parameters are replaced.
 
-    def _update_gaussians(self, positions_raw, scales_raw, rotations, intensities_raw, raw_opacities):
+    def _update_gaussians(self, positions_raw, scales_raw, rotations, intensities_raw):
         self.N = int(positions_raw.shape[0])
         self.positions_raw = nn.Parameter(positions_raw.contiguous())
         self.scales_raw = nn.Parameter(scales_raw.contiguous())
         self.rotations = nn.Parameter(rotations.contiguous())
         self.intensities_raw = nn.Parameter(intensities_raw.contiguous())
-        self.raw_opacities = nn.Parameter(raw_opacities.contiguous())
         # Invalidate FAISS cache since Gaussians changed
         self._faiss_index = None
         self._faiss_index_positions = None
@@ -659,7 +644,6 @@ class CUDAGaussianModel(nn.Module):
             scales_raw=torch.cat([self.scales_raw.data, self.scales_raw.data[mask].clone()], dim=0),
             rotations=torch.cat([self.rotations.data, self.rotations.data[mask].clone()], dim=0),
             intensities_raw=torch.cat([self.intensities_raw.data, self.intensities_raw.data[mask].clone()], dim=0),
-            raw_opacities=torch.cat([self.raw_opacities.data, self.raw_opacities.data[mask].clone()], dim=0),
         )
         return int(mask.sum().item())
 
@@ -677,13 +661,11 @@ class CUDAGaussianModel(nn.Module):
         sc_raw = self.scales_raw.data[idx]
         rot = self.rotations.data[idx]
         inten_raw = self.intensities_raw.data[idx]
-        op_raw = self.raw_opacities.data[idx]
 
         children_pos = []
         children_sc = []
         children_rot = []
         children_int = []
-        children_op = []
 
         # Precompute intensity adjustment for sigmoid activation
         # For sigmoid: to divide output by n_split, we need new_raw = logit(sigmoid(raw)/n)
@@ -704,13 +686,11 @@ class CUDAGaussianModel(nn.Module):
             children_sc.append(sc_raw - np.log(n_split + 1e-6))
             children_rot.append(rot.clone())
             children_int.append(new_inten_raw.clone())
-            children_op.append(op_raw.clone())
 
         new_pos_raw = torch.cat(children_pos, dim=0)
         new_sc_raw = torch.cat(children_sc, dim=0)
         new_rot = torch.cat(children_rot, dim=0)
         new_int_raw = torch.cat(children_int, dim=0)
-        new_op_raw = torch.cat(children_op, dim=0)
 
         keep = (~mask)
         self._update_gaussians(
@@ -718,7 +698,6 @@ class CUDAGaussianModel(nn.Module):
             scales_raw=torch.cat([self.scales_raw.data[keep], new_sc_raw], dim=0),
             rotations=torch.cat([self.rotations.data[keep], new_rot], dim=0),
             intensities_raw=torch.cat([self.intensities_raw.data[keep], new_int_raw], dim=0),
-            raw_opacities=torch.cat([self.raw_opacities.data[keep], new_op_raw], dim=0),
         )
         return int(M)
 
@@ -737,7 +716,6 @@ class CUDAGaussianModel(nn.Module):
             scales_raw=self.scales_raw.data[keep],
             rotations=self.rotations.data[keep],
             intensities_raw=self.intensities_raw.data[keep],
-            raw_opacities=self.raw_opacities.data[keep],
         )
         return num_pruned
 

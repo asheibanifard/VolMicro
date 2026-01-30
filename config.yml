@@ -136,7 +136,7 @@ output:
   save_npz: true    # Save NPZ with full model data
   
   # Output directory (relative to input file or absolute)
-  output_dir: "output"
+  output_dir: "/workspace/VolMicro/output"
 
 # -----------------------------------------------------------------------------
 # Rendering Configuration
