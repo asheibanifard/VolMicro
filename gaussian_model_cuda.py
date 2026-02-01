@@ -211,8 +211,13 @@ class CUDAGaussianModel(nn.Module):
 
     @property
     def scales(self) -> torch.Tensor:
-        # (N,3) > 0
-        return F.softplus(self.scales_raw) + 1e-6
+        # (N,3) > 0, clamped to [min_scale, max_scale] for stability
+        # min_scale: ~0.5 voxel in normalized coords
+        # max_scale: ~5% of volume (prevents Gaussians covering everything)
+        min_scale = 0.001  # ~0.5-1 voxel for typical volumes
+        max_scale = 0.05   # 5% of volume dimension
+        raw_scales = F.softplus(self.scales_raw) + 1e-6
+        return raw_scales.clamp(min_scale, max_scale)
 
     def intensities(self) -> torch.Tensor:
         # Consistent activation for CUDA + export
@@ -628,12 +633,29 @@ class CUDAGaussianModel(nn.Module):
         self._faiss_index = None
         self._faiss_index_positions = None
 
-    def densify_and_clone(self, grads: torch.Tensor, grad_threshold: float, scale_threshold: float) -> int:
-        """Clone Gaussians with high grads and small scales."""
+    def densify_and_clone(self, grads: torch.Tensor, grad_threshold: float, scale_threshold: float, max_new: int = None) -> int:
+        """Clone Gaussians with high grads and small scales.
+        
+        Args:
+            grads: Gradient norms for each Gaussian
+            grad_threshold: Only clone if grad > threshold
+            scale_threshold: Only clone if scale <= threshold
+            max_new: Maximum number of new Gaussians to add (for stability)
+        """
         scales_max = self.scales.max(dim=1).values
         mask = (grads > grad_threshold) & (scales_max <= scale_threshold)
         if mask.sum() == 0:
             return 0
+        
+        # Limit number of clones for stability
+        if max_new is not None and mask.sum() > max_new:
+            # Select top max_new by gradient magnitude
+            indices = mask.nonzero(as_tuple=False).flatten()
+            grad_values = grads[indices]
+            _, top_idx = grad_values.topk(min(max_new, len(grad_values)))
+            new_mask = torch.zeros_like(mask)
+            new_mask[indices[top_idx]] = True
+            mask = new_mask
 
         # small offsets in *raw* space -> stable after sigmoid mapping
         pos_raw = self.positions_raw.data

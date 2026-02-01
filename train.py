@@ -22,6 +22,7 @@ import json
 import argparse
 from tqdm import tqdm
 from dataclasses import dataclass
+from typing import Optional
 
 # Try to import fused_ssim and lpips
 try:
@@ -30,12 +31,13 @@ try:
 except ImportError:
     HAS_FUSED_SSIM = False
     print("Warning: fused_ssim not available, using pytorch_msssim")
-    try:
-        from pytorch_msssim import ssim as pytorch_ssim
-        HAS_PYTORCH_SSIM = True
-    except ImportError:
-        HAS_PYTORCH_SSIM = False
-        print("Warning: pytorch_msssim not available, SSIM will be disabled")
+
+try:
+    from pytorch_msssim import ssim as pytorch_ssim
+    HAS_PYTORCH_SSIM = True
+except ImportError:
+    HAS_PYTORCH_SSIM = False
+    print("Warning: pytorch_msssim not available, SSIM will be disabled")
 
 try:
     import lpips
@@ -58,6 +60,266 @@ from losses import (
     compute_ssim
 )
 from scipy import ndimage
+
+
+@dataclass
+class AdaptiveSamplingConfig:
+    """Configuration for staged adaptive sampling strategy.
+    
+    Early training (0-30%): High sampling rate for global structure
+    Mid training (30-70%): Moderate sampling with error-based importance
+    Late training (70-100%): Low sampling focused on high-error regions
+    """
+    # Phase boundaries (fraction of total iterations)
+    early_phase_end: float = 0.30
+    mid_phase_end: float = 0.70
+    
+    # Sampling rates per phase (fraction of gated voxels)
+    early_sample_rate: float = 0.08  # 5-10% -> 8%
+    mid_sample_rate: float = 0.02   # 1-3% -> 2%
+    late_sample_rate: float = 0.008  # 0.5-1% -> 0.8%
+    
+    # Early phase: prioritize high-intensity regions
+    early_intensity_weight: float = 2.0  # Boost sampling of high-intensity voxels
+    early_uniform_depth: bool = True  # Ensure uniform sampling across depth
+    
+    # Mid phase: importance sampling based on reconstruction error
+    mid_error_weight: float = 3.0  # Weight for high-error regions
+    mid_boundary_boost: float = 2.0  # Extra weight for boundary voxels
+    
+    # Late phase: focus on difficult regions
+    late_error_weight: float = 5.0  # Strong focus on high-error
+    late_thin_structure_boost: float = 2.0  # Boost thin structures
+    
+    # Full volume evaluation interval (late phase)
+    full_eval_interval: int = 100  # Evaluate full volume every N iterations
+    
+    # Error map update interval
+    error_update_interval: int = 50  # Update error map every N iterations
+
+
+class AdaptiveSamplingScheduler:
+    """Manages staged adaptive sampling throughout training.
+    
+    Stages:
+    1. Early (0-30%): 5-10% sampling, prioritize high-intensity, uniform depth
+    2. Mid (30-70%): 1-3% sampling, importance sampling by error, oversample boundaries
+    3. Late (70-100%): 0.5-1% sampling, focus high-error regions, periodic full eval
+    """
+    
+    def __init__(
+        self,
+        n_gated: int,
+        gated_coords: torch.Tensor,
+        gated_gt: torch.Tensor,
+        gated_indices: torch.Tensor,
+        volume_shape: tuple,
+        config: AdaptiveSamplingConfig,
+        device: str = 'cuda'
+    ):
+        self.n_gated = n_gated
+        self.gated_coords = gated_coords
+        self.gated_gt = gated_gt
+        self.gated_indices = gated_indices
+        self.volume_shape = volume_shape
+        self.config = config
+        self.device = device
+        
+        # Precompute intensity-based sampling weights (for early phase)
+        self.intensity_weights = self._compute_intensity_weights()
+        
+        # Precompute depth indices for uniform depth sampling
+        self.depth_bins = self._precompute_depth_bins()
+        
+        # Precompute boundary mask (for mid phase)
+        self.boundary_mask = self._compute_boundary_mask()
+        
+        # Error map (updated during training)
+        self.error_map = torch.ones(n_gated, device=device)  # Start uniform
+        self.last_error_update = -1
+        
+        # Thin structure mask (for late phase)
+        self.thin_structure_mask = self._compute_thin_structure_mask()
+        
+        print(f"  AdaptiveSamplingScheduler initialized:")
+        print(f"    Early phase (0-{config.early_phase_end*100:.0f}%): {config.early_sample_rate*100:.1f}% sampling")
+        print(f"    Mid phase ({config.early_phase_end*100:.0f}-{config.mid_phase_end*100:.0f}%): {config.mid_sample_rate*100:.1f}% sampling")
+        print(f"    Late phase ({config.mid_phase_end*100:.0f}-100%): {config.late_sample_rate*100:.2f}% sampling")
+    
+    def _compute_intensity_weights(self) -> torch.Tensor:
+        """Compute sampling weights based on voxel intensity."""
+        # Higher intensity -> higher weight
+        weights = self.gated_gt.clone()
+        weights = weights - weights.min() + 0.1  # Shift to avoid zero weights
+        weights = weights ** self.config.early_intensity_weight  # Boost high intensity
+        weights = weights / weights.sum()  # Normalize to probability distribution
+        return weights
+    
+    def _precompute_depth_bins(self) -> dict:
+        """Bin voxels by depth (z-coordinate) for uniform depth sampling."""
+        D = self.volume_shape[0]
+        num_bins = min(D, 32)  # Use up to 32 depth bins
+        bin_size = D / num_bins
+        
+        depth_indices = self.gated_indices[:, 0].float()
+        bin_assignments = (depth_indices / bin_size).long().clamp(0, num_bins - 1)
+        
+        bins = {}
+        for b in range(num_bins):
+            mask = bin_assignments == b
+            bins[b] = torch.nonzero(mask, as_tuple=True)[0]
+        
+        return bins
+    
+    def _compute_boundary_mask(self) -> torch.Tensor:
+        """Identify boundary voxels (edges of structures)."""
+        # Use gradient magnitude as proxy for boundaries
+        mask = torch.zeros(self.n_gated, device=self.device)
+        
+        # Simple heuristic: voxels with neighbors that have very different intensity
+        # For efficiency, just mark voxels near the edges of the intensity distribution
+        intensity_mean = self.gated_gt.mean()
+        intensity_std = self.gated_gt.std()
+        
+        # Boundary = moderate intensity (between low and high)
+        lower = intensity_mean - 0.5 * intensity_std
+        upper = intensity_mean + 0.5 * intensity_std
+        mask = ((self.gated_gt > lower) & (self.gated_gt < upper)).float()
+        
+        return mask
+    
+    def _compute_thin_structure_mask(self) -> torch.Tensor:
+        """Identify thin structures (dendrites, axons)."""
+        # Heuristic: high intensity but surrounded by lower values
+        # For simplicity, use high-intensity voxels
+        threshold = self.gated_gt.mean() + self.gated_gt.std()
+        return (self.gated_gt > threshold).float()
+    
+    def get_phase(self, iteration: int, total_iterations: int) -> str:
+        """Determine current training phase."""
+        progress = iteration / max(total_iterations - 1, 1)
+        if progress < self.config.early_phase_end:
+            return 'early'
+        elif progress < self.config.mid_phase_end:
+            return 'mid'
+        else:
+            return 'late'
+    
+    def get_num_samples(self, iteration: int, total_iterations: int) -> int:
+        """Get number of samples for current iteration."""
+        phase = self.get_phase(iteration, total_iterations)
+        cfg = self.config
+        
+        if phase == 'early':
+            rate = cfg.early_sample_rate
+        elif phase == 'mid':
+            rate = cfg.mid_sample_rate
+        else:
+            rate = cfg.late_sample_rate
+        
+        return max(1000, int(self.n_gated * rate))  # Minimum 1000 samples
+    
+    def should_do_full_eval(self, iteration: int, total_iterations: int) -> bool:
+        """Check if we should do full volume evaluation."""
+        phase = self.get_phase(iteration, total_iterations)
+        if phase == 'late':
+            return iteration % self.config.full_eval_interval == 0
+        return False
+    
+    def update_error_map(self, model, iteration: int):
+        """Update error map based on current reconstruction."""
+        if iteration - self.last_error_update < self.config.error_update_interval:
+            return
+        
+        with torch.no_grad():
+            # Sample a subset to estimate errors
+            sample_size = min(50000, self.n_gated)
+            idx = torch.randperm(self.n_gated, device=self.device)[:sample_size]
+            coords = self.gated_coords[idx]
+            gt = self.gated_gt[idx]
+            
+            pred = model.forward_knn(coords, k=32, sigma_cutoff=5.0)
+            errors = (pred - gt).abs()
+            
+            # Update error map (smoothed)
+            self.error_map[idx] = 0.7 * self.error_map[idx] + 0.3 * errors
+        
+        self.last_error_update = iteration
+    
+    def sample(self, iteration: int, total_iterations: int, model=None) -> torch.Tensor:
+        """Sample voxel indices for current iteration.
+        
+        Returns:
+            indices: Tensor of indices into gated_coords/gated_gt
+        """
+        phase = self.get_phase(iteration, total_iterations)
+        num_samples = self.get_num_samples(iteration, total_iterations)
+        cfg = self.config
+        
+        if phase == 'early':
+            return self._sample_early(num_samples)
+        elif phase == 'mid':
+            # Update error map periodically
+            if model is not None:
+                self.update_error_map(model, iteration)
+            return self._sample_mid(num_samples)
+        else:
+            # Late phase
+            if model is not None:
+                self.update_error_map(model, iteration)
+            return self._sample_late(num_samples)
+    
+    def _sample_early(self, num_samples: int) -> torch.Tensor:
+        """Early phase: prioritize high-intensity, uniform depth."""
+        cfg = self.config
+        
+        if cfg.early_uniform_depth and len(self.depth_bins) > 1:
+            # Sample uniformly across depth bins
+            samples_per_bin = num_samples // len(self.depth_bins)
+            indices = []
+            
+            for bin_idx in self.depth_bins.values():
+                if len(bin_idx) == 0:
+                    continue
+                n = min(samples_per_bin, len(bin_idx))
+                
+                # Within each bin, sample weighted by intensity
+                bin_weights = self.intensity_weights[bin_idx]
+                bin_weights = bin_weights / bin_weights.sum()
+                
+                sampled = torch.multinomial(bin_weights, n, replacement=True)
+                indices.append(bin_idx[sampled])
+            
+            return torch.cat(indices) if indices else torch.randint(0, self.n_gated, (num_samples,), device=self.device)
+        else:
+            # Simple intensity-weighted sampling
+            return torch.multinomial(self.intensity_weights, num_samples, replacement=True)
+    
+    def _sample_mid(self, num_samples: int) -> torch.Tensor:
+        """Mid phase: importance sampling by error + boundary boost."""
+        cfg = self.config
+        
+        # Combine error-based and boundary-based weights
+        error_weights = self.error_map ** cfg.mid_error_weight
+        boundary_weights = 1.0 + cfg.mid_boundary_boost * self.boundary_mask
+        
+        combined = error_weights * boundary_weights
+        combined = combined / combined.sum()
+        
+        return torch.multinomial(combined, num_samples, replacement=True)
+    
+    def _sample_late(self, num_samples: int) -> torch.Tensor:
+        """Late phase: focus on high-error and thin structures."""
+        cfg = self.config
+        
+        # Strong focus on errors + thin structure boost
+        error_weights = self.error_map ** cfg.late_error_weight
+        thin_weights = 1.0 + cfg.late_thin_structure_boost * self.thin_structure_mask
+        
+        combined = error_weights * thin_weights
+        combined = combined / combined.sum()
+        
+        return torch.multinomial(combined, num_samples, replacement=True)
 
 
 def compute_edge_weights(volume: np.ndarray, sigma: float = 1.0, base_weight: float = 1.0, edge_boost: float = 5.0) -> np.ndarray:
@@ -174,21 +436,22 @@ class SparseTrainerConfig:
     lr_decay_start: int = 5000  # Start decay after densification stops
     finetune_lr: float = 0.001  # Lower LR for fine-tuning phase after densification
     lambda_sparsity: float = 0.00001  # Very low for fine structures
-    lambda_overlap: float = 0.0  # Overlap regularization (0 = disabled)
-    lambda_smoothness: float = 0.0  # Smoothness regularization (0 = disabled)
+    lambda_overlap: float = 0.001  # Overlap regularization (0 = disabled)
+    lambda_smoothness: float = 0.001  # Smoothness regularization (0 = disabled)
     smoothness_neighbors: int = 5  # k-NN for smoothness
     knn_k: int = 80  # More neighbors for higher accuracy (was 48)
-    densify_grad_threshold: float = 0.0005  # Higher = less aggressive densification
+    densify_grad_threshold: float = 0.001  # Higher = less aggressive densification (was 0.0005)
     densify_scale_threshold: float = 0.005  # Clone small (<0.005), split large (>0.005)
     densify_interval: int = 200  # More frequent densification
     densify_start: int = 200  # Start earlier
     densify_stop: int = 5000  # Continue longer for refinement
-    max_gaussians: int = 100000  # More Gaussians for fine structures
+    max_gaussians: int = 30000  # Max Gaussians for fine structures
+    max_densify_per_step: int = 2000  # Max Gaussians to add per densification step (stability)
     # Pruning thresholds (aggressive)
     prune_intensity_threshold: float = 0.02  # Prune if intensity < 2% (sigmoid output)
     prune_scale_threshold: float = 0.05  # Prune if max scale > 5% of volume (too large)
     # Edge-aware loss settings
-    use_edge_weights: bool = True  # Weight loss higher on edges
+    use_edge_weights: bool = False  # Weight loss higher on edges
     edge_boost: float = 3.0  # How much to boost edge regions
 
 
@@ -205,7 +468,7 @@ class SparseGateGuidedTrainer:
         gate_mask: torch.Tensor,
         config: SparseTrainerConfig,
         device: str = 'cuda',
-        output_dir: str = None
+        output_dir: Optional[str] = None
     ):
         self.model = model
         self.device = device
@@ -264,6 +527,9 @@ class SparseGateGuidedTrainer:
         
         print(f"  Sparse training on {self.n_gated:,} gated voxels ({100*self.n_gated/(self.D*self.H*self.W):.2f}%)")
         print(f"  Speedup: ~{(self.D*self.H*self.W)/self.n_gated:.1f}x vs dense")
+        
+        # Adaptive sampling scheduler (None = use legacy sampling)
+        self.adaptive_sampler = None
         
         # Optimizer
         self.optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
@@ -325,7 +591,7 @@ class SparseGateGuidedTrainer:
         # Overlap regularization: λ·Σᵢ<ⱼ O(Gᵢ,Gⱼ) (using losses.py)
         overlap_loss = torch.tensor(0.0, device=self.device)
         if self.use_overlap:
-            positions = self.model.positions()
+            positions = self.model.positions
             covariance = self.model.get_covariance_matrices()
             overlap_loss = self.overlap_loss(positions, covariance)
             total_loss = total_loss + overlap_loss
@@ -333,7 +599,7 @@ class SparseGateGuidedTrainer:
         # Smoothness regularization: λ·Σᵢ Σⱼ∈𝒩(i) ||θᵢ-θⱼ||² (using losses.py)
         smoothness_loss = torch.tensor(0.0, device=self.device)
         if self.use_smoothness:
-            positions = self.model.positions()
+            positions = self.model.positions
             log_scales = self.model.log_scales()
             smoothness_loss = self.smoothness_loss(positions, intensities, log_scales)
             total_loss = total_loss + smoothness_loss
@@ -370,7 +636,7 @@ class SparseGateGuidedTrainer:
         # Overlap regularization (computed on all Gaussians, not sampled voxels)
         overlap_loss = torch.tensor(0.0, device=self.device)
         if self.use_overlap:
-            positions = self.model.positions()
+            positions = self.model.positions
             covariance = self.model.get_covariance_matrices()
             overlap_loss = self.overlap_loss(positions, covariance)
             total_loss = total_loss + overlap_loss
@@ -378,7 +644,7 @@ class SparseGateGuidedTrainer:
         # Smoothness regularization (computed on all Gaussians)
         smoothness_loss = torch.tensor(0.0, device=self.device)
         if self.use_smoothness:
-            positions = self.model.positions()
+            positions = self.model.positions
             log_scales = self.model.log_scales()
             smoothness_loss = self.smoothness_loss(positions, intensities, log_scales)
             total_loss = total_loss + smoothness_loss
@@ -428,7 +694,8 @@ class SparseGateGuidedTrainer:
                 if HAS_FUSED_SSIM:
                     # fused_ssim expects (B, C, H, W) in [0, 1]
                     ssim_val = fused_ssim(pred_mip.clamp(0, 1), gt_mip.clamp(0, 1))
-                elif HAS_PYTORCH_SSIM:
+                elif not HAS_FUSED_SSIM and HAS_PYTORCH_SSIM:
+                    from pytorch_msssim import ssim as pytorch_ssim
                     ssim_val = pytorch_ssim(pred_mip.clamp(0, 1), gt_mip.clamp(0, 1), data_range=1.0)
                 else:
                     ssim_val = torch.tensor(0.0)
@@ -442,8 +709,9 @@ class SparseGateGuidedTrainer:
             return 0.0
         
         # Lazy init LPIPS model
-        if self._lpips_model is None:
-            self._lpips_model = lpips.LPIPS(net='vgg').to(self.device)
+        if self._lpips_model is None and HAS_LPIPS:
+            import lpips as lpips_module
+            self._lpips_model = lpips_module.LPIPS(net='vgg').to(self.device)
             self._lpips_model.eval()
         
         with torch.no_grad():
@@ -480,8 +748,9 @@ class SparseGateGuidedTrainer:
                                                           max(min_size, gt_rgb.shape[3])), 
                                           mode='bilinear', align_corners=False)
                 
-                lpips_val = self._lpips_model(pred_rgb.clamp(-1, 1), gt_rgb.clamp(-1, 1))
-                lpips_vals.append(lpips_val.item())
+                if self._lpips_model is not None:
+                    lpips_val = self._lpips_model(pred_rgb.clamp(-1, 1), gt_rgb.clamp(-1, 1))
+                    lpips_vals.append(lpips_val.item())
             
             return np.mean(lpips_vals)
     
@@ -508,13 +777,17 @@ class SparseGateGuidedTrainer:
         n_split = 0
         
         # Clone small Gaussians with high gradients (need more coverage)
+        # Limit to max_densify_per_step for stability
         if self.model.N < cfg.max_gaussians:
+            max_to_add = min(cfg.max_densify_per_step, cfg.max_gaussians - self.model.N)
             n_clone = self.model.densify_and_clone(
-                avg_grads, cfg.densify_grad_threshold, cfg.densify_scale_threshold
+                avg_grads, cfg.densify_grad_threshold, cfg.densify_scale_threshold,
+                max_new=max_to_add
             )
         
         # Split large Gaussians with high gradients (need finer detail)
         # Re-fetch gradients after clone since model size may have changed
+        n_split = 0
         if self.model.N < cfg.max_gaussians:
             # Pad gradients if clone added Gaussians
             if len(avg_grads) < self.model.N:
@@ -553,6 +826,63 @@ class SparseGateGuidedTrainer:
                     self.grad_accum += grad_norm
             self.grad_count += 1
     
+    def enable_adaptive_sampling(self, config: Optional[AdaptiveSamplingConfig] = None):
+        """Enable adaptive sampling with staged strategy."""
+        if config is None:
+            config = AdaptiveSamplingConfig()
+        
+        self.adaptive_sampler = AdaptiveSamplingScheduler(
+            n_gated=self.n_gated,
+            gated_coords=self.gated_coords,
+            gated_gt=self.gated_gt,
+            gated_indices=self.gated_indices,
+            volume_shape=(self.D, self.H, self.W),
+            config=config,
+            device=self.device
+        )
+    
+    def compute_loss_adaptive(self, iteration: int, total_iterations: int):
+        """Compute loss using adaptive sampling scheduler."""
+        if self.adaptive_sampler is None:
+            raise ValueError("Adaptive sampler not enabled. Call enable_adaptive_sampling() first.")
+        
+        # Get sample indices from scheduler
+        idx = self.adaptive_sampler.sample(iteration, total_iterations, model=self.model)
+        coords = self.gated_coords[idx]
+        gt_values = self.gated_gt[idx]
+        
+        pred_values = self.model.forward_knn(coords, k=self.config.knn_k, sigma_cutoff=5.0)
+        
+        # Weighted MSE if edge weights enabled
+        if self.gated_weights is not None:
+            weights = self.gated_weights[idx]
+            mse_loss = (weights * (pred_values - gt_values) ** 2).mean()
+        else:
+            mse_loss = self.reconstruction_loss(pred_values, gt_values)
+        
+        intensities = self.model.intensities()
+        sparsity_loss = self.sparsity_loss(intensities)
+        
+        total_loss = mse_loss + sparsity_loss
+        
+        # Overlap regularization
+        overlap_loss = torch.tensor(0.0, device=self.device)
+        if self.use_overlap:
+            positions = self.model.positions
+            covariance = self.model.get_covariance_matrices()
+            overlap_loss = self.overlap_loss(positions, covariance)
+            total_loss = total_loss + overlap_loss
+        
+        # Smoothness regularization
+        smoothness_loss = torch.tensor(0.0, device=self.device)
+        if self.use_smoothness:
+            positions = self.model.positions
+            log_scales = self.model.log_scales()
+            smoothness_loss = self.smoothness_loss(positions, intensities, log_scales)
+            total_loss = total_loss + smoothness_loss
+        
+        return total_loss, mse_loss, sparsity_loss, overlap_loss, smoothness_loss, len(idx)
+    
     def train(
         self,
         num_epochs: int,
@@ -560,12 +890,17 @@ class SparseGateGuidedTrainer:
         num_samples: int = 500000,
         eval_interval: int = 10,
         save_interval: int = 500,
-        save_dir: str = None,
+        save_dir: Optional[str] = None,
         verbose: bool = True,
-        use_densification: bool = False
+        use_densification: bool = False,
+        use_adaptive_sampling: bool = False
     ):
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
+        
+        # Enable adaptive sampling if requested
+        if use_adaptive_sampling and self.adaptive_sampler is None:
+            self.enable_adaptive_sampling()
         
         # Learning rate scheduler: 
         # - Use initial_lr during densification phase
@@ -592,12 +927,21 @@ class SparseGateGuidedTrainer:
             
             self.optimizer.zero_grad()
             
-            if use_sampling:
+            # Choose sampling strategy
+            n_sampled = 0
+            if use_adaptive_sampling and self.adaptive_sampler is not None:
+                total_loss, mse_loss, sparsity_loss, overlap_loss, smoothness_loss, n_sampled = self.compute_loss_adaptive(epoch, num_epochs)
+            elif use_sampling:
                 total_loss, mse_loss, sparsity_loss, overlap_loss, smoothness_loss = self.compute_loss_sparse_sampled(num_samples)
+                n_sampled = num_samples
             else:
                 total_loss, mse_loss, sparsity_loss, overlap_loss, smoothness_loss = self.compute_loss_sparse()
+                n_sampled = self.n_gated
             
             total_loss.backward()
+            
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
             if use_densification:
                 self.accumulate_gradients()
@@ -619,15 +963,29 @@ class SparseGateGuidedTrainer:
             self.history['densify_prune'].append(n_prune)
             
             if epoch % eval_interval == 0:
-                psnr = self.compute_psnr_sparse()
+                # Check if we should do full evaluation (late phase of adaptive sampling)
+                do_full_eval = False
+                if use_adaptive_sampling and self.adaptive_sampler is not None:
+                    do_full_eval = self.adaptive_sampler.should_do_full_eval(epoch, num_epochs)
+                
+                if do_full_eval:
+                    # Full volume evaluation in late phase
+                    psnr = self.compute_psnr_sparse(num_samples=self.n_gated)
+                else:
+                    psnr = self.compute_psnr_sparse()
                 self.history['psnr'].append(psnr)
                 
-                # SSIM/LPIPS disabled - too slow for large volumes
-                # Only compute at final epoch if needed
+                # Show phase info for adaptive sampling
+                phase_str = ''
+                if use_adaptive_sampling and self.adaptive_sampler is not None:
+                    phase = self.adaptive_sampler.get_phase(epoch, num_epochs)
+                    phase_str = f' [{phase}]'
+                
                 pbar.set_postfix({
                         'loss': f'{total_loss.item():.6f}',
                         'psnr': f'{psnr:.2f}',
-                        'N': self.model.N
+                        'N': self.model.N,
+                        'samp': n_sampled
                     })
             
             if save_dir and save_interval > 0 and (epoch + 1) % save_interval == 0:
@@ -699,9 +1057,10 @@ class SparseGateGuidedTrainer:
 def main():
     parser = argparse.ArgumentParser(description='Sparse Gate-Guided Gaussian Training')
     parser.add_argument('--volume', type=str, required=True, help='Path to volume TIFF')
-    parser.add_argument('--gate_checkpoint', type=str, required=True, help='Path to TOPS-Gate checkpoint')
+    parser.add_argument('--gate_checkpoint', type=str, default=None, help='Path to TOPS-Gate checkpoint (optional, if not provided uses all voxels)')
     parser.add_argument('--gate_tau', type=float, default=0.5, help='Gate threshold')
-    parser.add_argument('--num_gaussians', type=int, default=10000, help='Number of Gaussians')
+    parser.add_argument('--no_gate', action='store_true', help='Disable gating, use all voxels')
+    parser.add_argument('--num_gaussians', type=int, default=20000, help='Number of Gaussians')
     parser.add_argument('--epochs', type=int, default=1000, help='Training epochs')
     parser.add_argument('--lr', type=float, default=0.01, help='Learning rate')
     parser.add_argument('--output_dir', type=str, default='output/sparse_gate_gaussian', help='Output directory')
@@ -710,16 +1069,23 @@ def main():
     parser.add_argument('--eval_interval', type=int, default=10, help='PSNR eval interval')
     parser.add_argument('--save_interval', type=int, default=500, help='Checkpoint save interval')
     parser.add_argument('--use_sampling', action='store_true', help='Sample from gated voxels (faster)')
-    parser.add_argument('--sample_ratio', type=float, default=0.2, help='Fraction of gated voxels to sample (0.2 = 20%)')
+    parser.add_argument('--sample_ratio', type=float, default=0.01, help='Fraction of gated voxels to sample (0.2 = 20%)')
     parser.add_argument('--num_samples', type=int, default=0, help='Fixed samples per iteration (0 = use sample_ratio instead)')
     parser.add_argument('--knn_k', type=int, default=32, help='K nearest Gaussians per query (lower=faster, higher=more accurate)')
-    parser.add_argument('--lambda_sparsity', type=float, default=0.001, help='Sparsity regularization weight')
+    parser.add_argument('--lambda_sparsity', type=float, default=0.0, help='Sparsity regularization weight')
     parser.add_argument('--lambda_overlap', type=float, default=0.0, help='Overlap regularization weight (0=disabled)')
     parser.add_argument('--lambda_smoothness', type=float, default=0.0, help='Smoothness regularization weight (0=disabled)')
     parser.add_argument('--smoothness_neighbors', type=int, default=5, help='k-NN for smoothness regularization')
     parser.add_argument('--edge_boost', type=float, default=3.0, help='Edge loss weighting boost (0=disabled)')
     parser.add_argument('--no_edge_weights', action='store_true', help='Disable edge-aware loss weighting')
     parser.add_argument('--grad_threshold', type=float, default=0.0001, help='Gradient threshold for densification (lower=more densification)')
+    parser.add_argument('--adaptive_sampling', action='store_true', help='Use staged adaptive sampling (early/mid/late phases)')
+    parser.add_argument('--early_sample_rate', type=float, default=0.08, help='Sampling rate for early phase (default 8%)')
+    parser.add_argument('--mid_sample_rate', type=float, default=0.02, help='Sampling rate for mid phase (default 2%)')
+    parser.add_argument('--late_sample_rate', type=float, default=0.008, help='Sampling rate for late phase (default 0.8%)')
+    parser.add_argument('--early_phase_end', type=float, default=0.30, help='End of early phase (fraction of iterations)')
+    parser.add_argument('--mid_phase_end', type=float, default=0.70, help='End of mid phase (fraction of iterations)')
+    parser.add_argument('--crop', type=str, default=None, help='Crop volume to DxHxW from bottom-right corner (e.g., 100x64x64)')
     
     args = parser.parse_args()
     device = 'cuda'
@@ -763,12 +1129,40 @@ def main():
     gt_path = os.path.join(args.output_dir, 'ground_truth.tif')
     tifffile.imwrite(gt_path, volume)
     
-    # Load gate model
-    gate_model = load_tops_gate_model(args.gate_checkpoint, device)
+    # Load gate model or use all voxels
+    if args.no_gate or args.gate_checkpoint is None:
+        print("\n[NO GATING] Using ALL voxels for training")
+        gate_mask = torch.ones(volume_shape, dtype=torch.bool, device=device)
+        n_gated = int(gate_mask.sum().item())
+    else:
+        gate_model = load_tops_gate_model(args.gate_checkpoint, device)
+        
+        # Generate gate mask
+        gate_mask = generate_hard_gate_mask(gate_model, volume_shape, tau=args.gate_tau, device=device)
+        n_gated = int(gate_mask.sum().item())
     
-    # Generate gate mask
-    gate_mask = generate_hard_gate_mask(gate_model, volume_shape, tau=args.gate_tau, device=device)
-    n_gated = int(gate_mask.sum().item())
+    # Apply cropping if specified (from bottom-right corner)
+    if args.crop:
+        crop_dims = [int(x) for x in args.crop.split('x')]
+        if len(crop_dims) == 3:
+            crop_d, crop_h, crop_w = crop_dims
+            D, H, W = volume_shape
+            # Crop from bottom-right corner
+            d_start = max(0, D - crop_d)
+            h_start = max(0, H - crop_h)
+            w_start = max(0, W - crop_w)
+            print(f"\nCropping volume from bottom-right corner:")
+            print(f"  Original shape: {volume_shape}")
+            print(f"  Crop region: [{d_start}:{D}, {h_start}:{H}, {w_start}:{W}]")
+            volume = volume[d_start:D, h_start:H, w_start:W]
+            gate_mask = gate_mask[d_start:D, h_start:H, w_start:W]
+            volume_shape = volume.shape
+            total_voxels = np.prod(volume_shape)
+            n_gated = int(gate_mask.sum().item())
+            print(f"  New shape: {volume_shape}, total: {total_voxels:,} voxels")
+            print(f"  Gated voxels in crop: {n_gated:,} ({100*n_gated/total_voxels:.2f}%)")
+        else:
+            print(f"Warning: Invalid crop format '{args.crop}', expected DxHxW")
     
     # Save gate mask
     tifffile.imwrite(os.path.join(args.output_dir, 'gate_mask.tif'), 
@@ -830,8 +1224,23 @@ def main():
         output_dir=args.output_dir
     )
     
-    # Compute num_samples from ratio if not specified
-    if args.use_sampling:
+    # Configure sampling strategy
+    if args.adaptive_sampling:
+        # Set up adaptive sampling scheduler
+        adaptive_config = AdaptiveSamplingConfig(
+            early_phase_end=args.early_phase_end,
+            mid_phase_end=args.mid_phase_end,
+            early_sample_rate=args.early_sample_rate,
+            mid_sample_rate=args.mid_sample_rate,
+            late_sample_rate=args.late_sample_rate,
+        )
+        trainer.enable_adaptive_sampling(adaptive_config)
+        num_samples = 0  # Will be determined by scheduler
+        print(f"\nUsing ADAPTIVE SAMPLING:")
+        print(f"  Early phase (0-{args.early_phase_end*100:.0f}%): {args.early_sample_rate*100:.1f}% sampling")
+        print(f"  Mid phase ({args.early_phase_end*100:.0f}-{args.mid_phase_end*100:.0f}%): {args.mid_sample_rate*100:.1f}% sampling")
+        print(f"  Late phase ({args.mid_phase_end*100:.0f}-100%): {args.late_sample_rate*100:.2f}% sampling")
+    elif args.use_sampling:
         if args.num_samples > 0:
             num_samples = args.num_samples
         else:
@@ -850,13 +1259,14 @@ def main():
     
     history = trainer.train(
         num_epochs=args.epochs,
-        use_sampling=args.use_sampling,
+        use_sampling=args.use_sampling and not args.adaptive_sampling,
         num_samples=num_samples,
         eval_interval=args.eval_interval,
         save_interval=args.save_interval,
         save_dir=os.path.join(args.output_dir, 'checkpoints'),
         verbose=True,
-        use_densification=args.densify
+        use_densification=args.densify,
+        use_adaptive_sampling=args.adaptive_sampling
     )
     
     # Save results
@@ -881,7 +1291,8 @@ def main():
         'timestamp': datetime.now().isoformat(),
         'args': {
             'volume': args.volume,
-            'gate_checkpoint': args.gate_checkpoint,
+            'gate_checkpoint': args.gate_checkpoint if args.gate_checkpoint else 'none (no gating)',
+            'no_gate': args.no_gate,
             'gate_tau': args.gate_tau,
             'num_gaussians': args.num_gaussians,
             'epochs': args.epochs,
