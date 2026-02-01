@@ -47,6 +47,17 @@ References
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+
+# Try to import FAISS for GPU-accelerated KNN in overlap loss
+try:
+    import faiss
+    import faiss.contrib.torch_utils
+    FAISS_AVAILABLE = True
+    FAISS_GPU_AVAILABLE = faiss.get_num_gpus() > 0
+except ImportError:
+    FAISS_AVAILABLE = False
+    FAISS_GPU_AVAILABLE = False
 
 
 class ReconstructionLoss(nn.Module):
@@ -156,17 +167,20 @@ class SparsityRegularization(nn.Module):
         """
         Compute L1 sparsity regularization.
         
+        L_sparsity = λ_w · (1/N) · Σᵢ₌₁ᴺ |wᵢ|
+        
+        Note: We normalize by N to keep the loss scale independent of
+        the number of Gaussians, making lambda values more intuitive.
+        The formula still uses sum (matching proposal) but is normalized.
+        
         Args:
             weights: Gaussian weights/intensities of shape (N,)
             
         Returns:
-            Sparsity loss value: λ_w · mean(|w|)
-            
-        Note:
-            Using mean instead of sum makes the regularization strength
-            independent of the number of Gaussians N.
+            Sparsity loss value: λ_w · mean(|wᵢ|)
         """
-        return self.lambda_w * torch.mean(torch.abs(weights))
+        N = weights.shape[0]
+        return self.lambda_w * torch.sum(torch.abs(weights)) / N
 
 
 class OverlapRegularization(nn.Module):
@@ -234,52 +248,72 @@ class OverlapRegularization(nn.Module):
         self,
         positions: torch.Tensor,
         covariance: torch.Tensor,
-        max_pairs: int = 1000
+        knn_k: int = 16,
+        max_gaussians: int = 5000
     ) -> torch.Tensor:
         """
-        Compute overlap regularization using distance-based approximation.
+        Compute overlap regularization using KNN-based sampling (memory efficient).
         
-        Algorithm:
-            1. Compute pairwise distance matrix D[i,j] = ||μᵢ - μⱼ||
-            2. Estimate effective radius rᵢ = √(tr(Σᵢ)/3) for each Gaussian
-            3. Compute overlap: O[i,j] = exp(-D[i,j]² / (2(rᵢ+rⱼ)²))
-            4. Sum upper triangular (exclude diagonal self-overlap)
+        Algorithm (memory-efficient O(N*K) instead of O(N²)):
+            1. Sample up to max_gaussians if N is large
+            2. For each Gaussian, find K nearest neighbors
+            3. Compute overlap only with those K neighbors
+            4. Sum overlaps (approximation of full pairwise sum)
         
         Args:
             positions: Gaussian centers μᵢ of shape (N, 3)
             covariance: Covariance matrices Σᵢ of shape (N, 3, 3)
-            max_pairs: Maximum pairs to sample (for large N)
+            knn_k: Number of nearest neighbors to consider (default: 16)
+            max_gaussians: Max Gaussians to sample for very large N (default: 5000)
             
         Returns:
-            Overlap loss: λ_o · Σᵢ<ⱼ O(Gᵢ, Gⱼ)
+            Overlap loss: λ_o · Σᵢ Σⱼ∈KNN(i) O(Gᵢ, Gⱼ)
         """
         N = positions.shape[0]
         
         if N < 2:
             return torch.tensor(0.0, device=positions.device)
         
-        # Compute pairwise distances between Gaussian centers
-        # D[i,j] = ||μᵢ - μⱼ||₂
-        diff = positions.unsqueeze(1) - positions.unsqueeze(0)  # (N, N, 3)
-        distances = torch.norm(diff, dim=2)  # (N, N)
+        # Sample Gaussians if N is too large
+        if N > max_gaussians:
+            idx = torch.randperm(N, device=positions.device)[:max_gaussians]
+            positions = positions[idx]
+            covariance = covariance[idx]
+            N = max_gaussians
         
-        # Compute effective radius: r = √(tr(Σ)/3) = √(mean of eigenvalues)
-        # For diagonal Σ, this is √((σ₁² + σ₂² + σ₃²)/3)
+        # Compute effective radius: r = √(tr(Σ)/3)
         scales = torch.sqrt(torch.diagonal(covariance, dim1=1, dim2=2).mean(dim=1))  # (N,)
         
-        # Combined effective radius for each pair: rᵢ + rⱼ
-        combined_scales = scales.unsqueeze(1) + scales.unsqueeze(0)  # (N, N)
+        # For speed: sample a small subset of Gaussians for overlap computation
+        # Full overlap on all N is O(N²) which is too slow for training
+        sample_size = min(1000, N)  # Only use 1000 Gaussians max
+        if N > sample_size:
+            idx = torch.randperm(N, device=positions.device)[:sample_size]
+            positions = positions[idx]
+            scales = scales[idx]
+            N = sample_size
         
-        # Overlap measure: O[i,j] = exp(-D²/(2(rᵢ+rⱼ)²))
-        # This is analogous to evaluating a Gaussian at the other's center
-        overlap_measure = torch.exp(-distances**2 / (2 * combined_scales**2 + 1e-6))
+        # Adjust K to not exceed N-1
+        K = min(knn_k, N - 1)
         
-        # Mask diagonal (self-overlap = 1, not meaningful)
-        mask = ~torch.eye(N, dtype=torch.bool, device=positions.device)
-        overlap_values = overlap_measure[mask]
+        # Single vectorized computation (N is small now, ~1000)
+        # Pairwise distances: (N, N) - only 1M elements for N=1000
+        dist_sq = torch.cdist(positions, positions, p=2).pow(2)  # (N, N)
         
-        # Sum and divide by 2 (since O[i,j] = O[j,i] for symmetric pairs)
-        total_overlap = torch.sum(overlap_values) / 2.0
+        # Combined scales for all pairs: (N, N)
+        combined_r = scales.unsqueeze(1) + scales.unsqueeze(0)  # (N, N)
+        
+        # Overlap matrix: (N, N)
+        overlap = torch.exp(-dist_sq / (2 * combined_r ** 2 + 1e-6))
+        
+        # Zero diagonal (self-overlap) - use mask instead of inplace
+        diag_mask = torch.eye(N, dtype=torch.bool, device=positions.device)
+        overlap = overlap.masked_fill(diag_mask, 0.0)
+        
+        # Sum upper triangle only (each pair once)
+        # Normalize by number of pairs: N*(N-1)/2
+        num_pairs = N * (N - 1) / 2
+        total_overlap = overlap.triu(diagonal=1).sum() / max(1.0, num_pairs)
         
         return self.lambda_o * total_overlap
 
@@ -383,17 +417,28 @@ class SmoothnessRegularization(nn.Module):
         _, indices = torch.topk(distances, k + 1, largest=False, dim=1)
         neighbor_indices = indices[:, 1:]  # (N, k) - exclude self (index 0)
         
-        # Weight smoothness: L_w = (1/Nk) · Σᵢ Σⱼ∈𝒩(i) (wᵢ - wⱼ)²
+        # Discrete gradient approximation: ∇_u G_i ≈ (G_i - G_j) / ||μ_i - μ_j||
+        # L_smoothness = λ_s · Σᵢ ||∇_u Gᵢ||²
+        
+        # Get neighbor distances for normalization
+        neighbor_distances = distances.gather(1, neighbor_indices)  # (N, k)
+        neighbor_distances = neighbor_distances.clamp(min=1e-6)  # Avoid div by zero
+        
+        # Weight gradient: ∇w ≈ (wᵢ - wⱼ) / d_ij
         weight_neighbors = weights[neighbor_indices]  # (N, k)
         weight_diff = weights.unsqueeze(1) - weight_neighbors  # (N, k)
-        weight_smoothness = torch.mean(weight_diff ** 2)
+        weight_grad_sq = (weight_diff / neighbor_distances) ** 2  # (N, k)
+        weight_smoothness = torch.sum(weight_grad_sq)  # Σᵢ Σⱼ∈𝒩(i)
         
-        # Scale smoothness: L_s = (1/3Nk) · Σᵢ Σⱼ∈𝒩(i) ||log(sᵢ) - log(sⱼ)||²
+        # Scale gradient: ∇s ≈ (log sᵢ - log sⱼ) / d_ij  
         scale_neighbors = log_scales[neighbor_indices]  # (N, k, 3)
         scale_diff = log_scales.unsqueeze(1) - scale_neighbors  # (N, k, 3)
-        scale_smoothness = torch.mean(scale_diff ** 2)
+        scale_grad_sq = (scale_diff / neighbor_distances.unsqueeze(-1)) ** 2  # (N, k, 3)
+        scale_smoothness = torch.sum(scale_grad_sq)  # Σᵢ ||∇sᵢ||²
         
-        return self.lambda_s * (weight_smoothness + scale_smoothness)
+        # Normalize by N*k to keep loss scale independent of N and k
+        num_edges = N * k
+        return self.lambda_s * (weight_smoothness + scale_smoothness) / num_edges
 
 
 class TotalLoss(nn.Module):

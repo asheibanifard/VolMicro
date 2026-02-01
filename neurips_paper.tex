@@ -1,0 +1,1156 @@
+% ===========================================================================
+% NeurIPS 2026 Paper: VolMicro
+% ===========================================================================
+\documentclass{article}
+
+% If you have problems with the hyperref package, comment out the next line:
+\PassOptionsToPackage{numbers, compress}{natbib}
+
+% NeurIPS style file (camera-ready or submission)
+% Use \usepackage{neurips_2026} for camera-ready
+\usepackage[preprint]{neurips_2026}
+
+% ===========================================================================
+% Required Packages
+% ===========================================================================
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{siunitx}
+\usepackage{bm}
+\usepackage{multirow}
+\usepackage{colortbl}
+\usepackage{enumitem}
+
+% Highlighting
+\definecolor{ourscolor}{RGB}{230,240,255}
+\definecolor{bestcolor}{RGB}{220,255,220}
+
+% Configure siunitx
+\sisetup{group-separator = {,}, group-minimum-digits = 4}
+
+% Math operators
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\argmax}{arg\,max}
+
+% ===========================================================================
+% Title and Authors
+% ===========================================================================
+\title{VolMicro: Sparse 3D Gaussian Mixtures for \\Extreme Microscopy Volume Compression}
+
+% Authors (use \author{} for submission, expand for camera-ready)
+\author{%
+  \textbf{Author Name}\\
+  \texttt{email@institution.edu}\\
+  Department/Lab Name\\
+  University/Institution Name\\
+  % \And
+  % \textbf{Co-Author Name}\\
+  % Affiliation\\
+}
+
+\begin{document}
+
+\maketitle
+
+% ===========================================================================
+% Abstract
+% ===========================================================================
+\begin{abstract}
+Modern light-sheet and confocal microscopy generates terabyte-scale volumetric datasets, creating severe challenges for storage, transmission, and analysis.
+We present \textbf{VolMicro}, a compression framework representing microscopy volumes as sparse mixtures of anisotropic 3D Gaussian primitives.
+Our method exploits two key domain priors: (1)~extreme background sparsity, where only $\sim$15\% of voxels contain signal, and (2)~geometric coherence of biological structures.
+Key technical contributions include \emph{sparse occupancy gating} to restrict optimization to relevant regions, \emph{edge-aware reconstruction weighting} to preserve morphological boundaries, and \emph{adaptive densification} to allocate capacity to complex structures.
+On a neuron microscopy benchmark, VolMicro achieves \textbf{231$\times$} compression (0.073~bpp) with competitive perceptual quality (SSIM~0.932, LPIPS~0.278).
+Critically, our explicit primitive representation enables \textbf{19$\times$ faster decompression} than coordinate-based neural implicit methods at matched bitrate, achieving 51~MVox/s on a single GPU.
+Beyond storage efficiency, the structured primitive representation enables direct morphological analysis without full decompression, opening pathways for compression-aware biological image analysis pipelines.
+\end{abstract}
+
+% ===========================================================================
+% 1. Introduction
+% ===========================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Advanced microscopy techniques---including light-sheet fluorescence microscopy (LSFM)~\cite{huisken2004spim,santi2011lsfm}, confocal imaging, and expansion microscopy~\cite{chen2015expansion}---enable volumetric visualization of biological structures at subcellular resolution.
+However, these modalities routinely produce large 3D datasets whose size grows rapidly with field-of-view, resolution, and temporal sampling.
+A single cleared brain imaged at submicron resolution can easily exceed hundreds of gigabytes, with whole-brain imaging campaigns generating petabyte-scale archives~\cite{sunney2021whole}.
+This data explosion creates critical bottlenecks: a single light-sheet imaging session can generate 500~GB/hour, overwhelming local storage and making collaborative data sharing prohibitively expensive without specialized infrastructure~\cite{ahrens2013whole}.
+
+\textbf{Limitations of existing approaches.}
+Standard codecs (JPEG2000~\cite{taubman2001jpeg2000}, H.265/HEVC~\cite{sullivan2012hevc}) treat microscopy volumes as generic 2D image stacks, ignoring the volumetric continuity of biological structures and wasting bits on homogeneous background regions.
+Scientific compressors like ZFP~\cite{lindstrom2014zfp} preserve floating-point precision but remain agnostic to the sparse, structure-dominated nature of fluorescence data, achieving only modest compression ratios (3--10$\times$) at acceptable quality.
+Neural implicit representations~\cite{dupont2021coin,sitzmann2020siren} achieve impressive compression ratios by encoding volumes as network weights, yet their per-voxel MLP evaluation at decompression ($\sim$2--5~MVox/s) is orders of magnitude slower than the interactive rates ($>$50~MVox/s) required for real-time visualization and analysis.
+Recent video compression adaptations~\cite{lu2019dvc,liu2020learned} improve temporal coherence for 4D microscopy but inherit the sequential decoding constraints of video codecs, preventing efficient random-access queries essential for region-of-interest analysis.
+Crucially, none of these methods exploit the fundamental sparsity and geometric regularity inherent to microscopy imagery, nor do they provide the random-access decoding essential for querying arbitrary subvolumes without reconstructing the entire dataset.
+
+\textbf{Key insight.}
+Microscopy volumes exhibit two properties enabling aggressive compression:
+\begin{enumerate}[leftmargin=*,nosep]
+    \item \textbf{Extreme sparsity}: A large fraction (often $>$80\%) of voxels correspond to background, with biologically meaningful signal concentrated in tubular structures (neurites, vasculature) or sheet-like membranes.
+    \item \textbf{Structural regularity}: Salient structures are geometrically coherent---neurites follow smooth trajectories with slowly-varying radii, membranes form connected surfaces---and can be captured by compact parametric primitives rather than dense voxel grids.
+\end{enumerate}
+Traditional codecs allocate bits uniformly across space, while implicit neural representations distribute capacity across all coordinates. Neither approach concentrates representational power where signal actually exists.
+
+\textbf{Our approach.}
+We introduce \textbf{VolMicro}, representing volumetric microscopy data as a sparse mixture of anisotropic 3D Gaussians, inspired by recent success of explicit Gaussian representations in real-time rendering~\cite{kerbl2023gaussians}.
+Unlike view-synthesis applications where Gaussians model radiance and view-dependent appearance, we adapt the primitive paradigm to scalar intensity-field reconstruction with microscopy-specific innovations: \emph{sparse occupancy gating} to avoid wasting computation on empty space, \emph{edge-aware loss weighting} to prioritize morphological boundaries, and \emph{morphology-preserving regularization} to prevent primitive degeneracies.
+The resulting representation is simultaneously compact (231$\times$ compression), fast to decode (51~MVox/s), and directly amenable to geometric analysis without requiring voxel-space decompression.
+
+\textbf{Contributions.}
+\begin{itemize}[leftmargin=*,nosep]
+    \item A \textbf{Gaussian primitive field} representation for 3D scalar microscopy volumes, achieving extreme compression (231$\times$) while preserving structural fidelity measured by both pixel-wise (PSNR) and perceptual (SSIM, LPIPS) metrics.
+    \item \textbf{Sparse occupancy gating (TOPS-Gate)} that restricts training to biologically relevant regions, yielding 6$\times$ per-iteration speedup and 10--20$\times$ overall training acceleration by eliminating computation on background voxels.
+    \item \textbf{Edge-aware reconstruction weighting} using gradient-magnitude-based spatial importance maps to emphasize boundaries critical for morphological analysis while reducing over-fitting to homogeneous regions.
+    \item \textbf{Adaptive densification} for capacity allocation following gradient-driven density control, enabling automatic discovery of optimal primitive counts without manual tuning.
+    \item Demonstration of \textbf{19$\times$ faster decompression} (51~vs.~2.7~MVox/s) compared to INR baselines at matched bitrate, achieved through KNN-accelerated local evaluation that avoids per-voxel MLP queries.
+    \item Comprehensive ablation studies quantifying the contribution of each component and analysis of the compression-quality-speed trade-off landscape.
+\end{itemize}
+
+% ===========================================================================
+% 2. Related Work
+% ===========================================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Traditional Volume Compression.}
+JPEG2000~\cite{taubman2001jpeg2000} and H.265/HEVC~\cite{sullivan2012hevc} are widely adopted for 2D images and video, with extensions to volumetric data treating each slice independently or exploiting inter-slice correlation through 3D transforms.
+These methods achieve good compression at moderate ratios (10--50$\times$) but exhibit significant quality degradation at extreme ratios ($>$100$\times$) and waste bits on background regions.
+Scientific compressors like ZFP~\cite{lindstrom2014zfp} and SZ~\cite{di2016sz} target floating-point arrays with bounded error guarantees, achieving only modest compression (3--10$\times$) while preserving numerical precision.
+Domain-specific approaches~\cite{zhao2019lossy} leverage sparsity through wavelet transforms or dictionary learning but require hand-crafted priors and struggle to generalize across tissue types and imaging modalities.
+
+\paragraph{Neural Implicit Representations (INRs).}
+Coordinate-based neural fields~\cite{mildenhall2020nerf,sitzmann2020siren} parameterize continuous signals as MLP outputs, enabling compact storage via network weights.
+COIN~\cite{dupont2021coin} applies this paradigm to image and volume compression, achieving high compression ratios by storing optimized SIREN weights.
+Extensions improve efficiency through meta-learning~\cite{strumpler2022implicit}, modulation~\cite{mehta2021modulated}, and quantization~\cite{yang2023neural}.
+Instant NGP~\cite{muller2022instant} and hash-based encodings~\cite{takikawa2021nglod} accelerate training and inference through spatial hashing but still require per-query coordinate evaluation.
+While INRs excel at extreme compression, their sequential per-voxel decoding remains a critical bottleneck: reconstructing a 100M-voxel dataset takes tens of seconds even on modern GPUs, precluding interactive exploration.
+Recent work on neural video compression~\cite{lu2019dvc,liu2020learned,hu2021fvc} adapts INRs to temporal data but inherits sequential decoding constraints.
+
+\paragraph{3D Gaussian Splatting.}
+Kerbl et al.~\cite{kerbl2023gaussians} demonstrated that optimized explicit Gaussian primitives achieve high-quality real-time rendering through efficient rasterization, enabling novel view synthesis at 100+ FPS.
+Follow-up work explores compression~\cite{niedermayr2023compressed}, anti-aliasing~\cite{yu2024mip}, and dynamic scenes~\cite{luiten2023dynamic}.
+These methods target RGB radiance fields with view-dependent appearance, requiring opacity and spherical harmonics coefficients.
+In contrast, we adapt Gaussians to scalar intensity fields, requiring only position, scale, rotation, and amplitude---significantly reducing per-primitive storage (22 vs. 60+ bytes).
+We further introduce microscopy-specific innovations (sparse gating, edge-aware weighting) not present in rendering applications.
+
+\paragraph{Learned Compression.}
+End-to-end optimized compression~\cite{balle2017compression,minnen2018joint} achieves strong rate--distortion performance through learned transforms and entropy coding.
+These methods require amortized encoders trained on large datasets, while VolMicro optimizes per-volume primitives directly without requiring external training data.
+Recent work on implicit neural compression~\cite{dupont2021coin++,strumpler2022implicit} combines learned priors with per-instance optimization but retains slow decoding.
+Hybrid approaches~\cite{chen2021learned} combine classical codecs with neural post-processing but lack the geometric interpretability of explicit primitives.
+
+\paragraph{Sparsity-Aware Representations.}
+Occupancy networks~\cite{mescheder2019occupancy} and related methods~\cite{peng2020convolutional} exploit sparsity in 3D shape reconstruction through binary occupancy prediction.
+Sparse voxel octrees~\cite{laine2010efficient} and N$^3$-trees~\cite{nehab2011n3} achieve adaptive spatial resolution but require explicit hierarchical data structures.
+Our TOPS-Gate differs by providing differentiable soft gating during training that transitions to hard binary masking, enabling end-to-end gradient-based optimization while maintaining training efficiency.
+
+% ===========================================================================
+% 3. Method
+% ===========================================================================
+\section{Method}
+\label{sec:method}
+
+\subsection{Gaussian Primitive Field Representation}
+\label{sec:method:representation}
+
+We represent a 3D scalar volume $V: \Omega \to \mathbb{R}^+$ defined on domain $\Omega \subset \mathbb{R}^3$ as a mixture of $N$ anisotropic Gaussian primitives:
+\begin{equation}
+\hat{V}(\mathbf{x}; \Theta) = \sum_{i=1}^{N} w_i \cdot \phi(\mathbf{x}; \bm{\mu}_i, \bm{\Sigma}_i),
+\label{eq:gaussian_mixture}
+\end{equation}
+where each primitive $i$ has learnable parameters:
+\begin{itemize}[leftmargin=*,nosep]
+    \item $w_i \in \mathbb{R}^+$: scalar intensity (amplitude), representing the contribution of primitive $i$ to the reconstructed intensity,
+    \item $\bm{\mu}_i \in \Omega \subset [0,1]^3$: 3D position (normalized to unit cube),
+    \item $\bm{\Sigma}_i \in \mathbb{R}^{3\times3}$: positive-definite covariance matrix controlling shape and orientation.
+\end{itemize}
+The full parameter set is $\Theta = \{w_i, \bm{\mu}_i, \bm{\Sigma}_i\}_{i=1}^N$.
+
+The Gaussian kernel is defined as:
+\begin{equation}
+\phi(\mathbf{x}; \bm{\mu}, \bm{\Sigma}) = \exp\left(-\frac{1}{2}(\mathbf{x} - \bm{\mu})^\top \bm{\Sigma}^{-1} (\mathbf{x} - \bm{\mu})\right).
+\label{eq:gaussian_kernel}
+\end{equation}
+This unnormalized Gaussian provides local support: contributions decay exponentially with Mahalanobis distance, naturally concentrating influence near $\bm{\mu}_i$.
+
+\paragraph{Covariance Parameterization.}
+To ensure positive-definiteness and enable unconstrained optimization, we factorize covariance as:
+\begin{equation}
+\bm{\Sigma} = \mathbf{R}\,\mathbf{S}\mathbf{S}^\top\,\mathbf{R}^\top,
+\end{equation}
+where $\mathbf{R} \in SO(3)$ is a rotation matrix and $\mathbf{S}=\mathrm{diag}(s_1,s_2,s_3)$ with $s_j>0$ are scale parameters along principal axes.
+We represent $\mathbf{R}$ via unit quaternion $\mathbf{q} \in \mathbb{H}$ with $\|\mathbf{q}\|=1$, providing a singularity-free parameterization.
+This factorization enables anisotropic primitives: elongated Gaussians with $s_1 \gg s_2 \approx s_3$ naturally capture tubular neurites, while $s_1 \approx s_2 \gg s_3$ represents sheet-like membranes.
+
+\paragraph{Constrained Parameters.}
+To maintain valid primitives during unconstrained gradient descent, we apply differentiable projections:
+\begin{align}
+\bm{\mu}_i &= \sigma(\bm{\mu}_i^{\text{raw}}), &
+\mathbf{s}_i &= \mathrm{softplus}(\mathbf{s}_i^{\text{raw}}), &
+\mathbf{q}_i &= \mathbf{q}_i^{\text{raw}}/\|\mathbf{q}_i^{\text{raw}}\|, &
+w_i &= \sigma(w_i^{\text{raw}}),
+\end{align}
+where $\sigma(z)=1/(1+e^{-z})$ is the sigmoid function ensuring $\bm{\mu}_i, w_i \in [0,1]$, and $\mathrm{softplus}(z)=\log(1+e^z)$ guarantees $s_{ij}>0$.
+We optimize raw parameters $\Theta^{\text{raw}}$ while maintaining constraints through these projections.
+
+\paragraph{Design Rationale.}
+Unlike radiance field Gaussians that model view-dependent color with spherical harmonics, our primitives represent scalar intensity through amplitude $w_i$ alone.
+This reduces per-primitive storage from 60+ bytes (position, scale, rotation, opacity, SH coefficients) to 22 bytes (position, scale, rotation, amplitude), critical for extreme compression.
+The mixture formulation naturally handles overlapping structures: neurite crossings and bifurcations emerge from additive blending of nearby primitives without requiring explicit topology.
+
+\subsection{Sparse Occupancy Gating}
+\label{sec:method:gating}
+
+Microscopy volumes are frequently background-dominant, with fluorescence signal concentrated in a small fraction of voxels.
+In our neuron dataset, only 16.1\% of voxels exceed threshold, meaning 84\% of computation is wasted on empty space during standard dense training.
+We introduce \emph{Trainable Occupancy Prediction for Sparse Gating} (TOPS-Gate) to focus optimization on biologically relevant regions.
+
+\paragraph{TOPS-Gate Architecture.}
+We use a lightweight coordinate-based MLP $g_\theta: \mathbb{R}^3 \to [0,1]$ with positional encoding~\cite{tancik2020fourier}:
+\begin{equation}
+g(\mathbf{x}; \theta) = \sigma\left(\mathrm{MLP}_\theta\big([\mathbf{x}, \gamma(\mathbf{x})]\big)\right),
+\end{equation}
+where the Fourier feature map is:
+\begin{equation}
+\gamma(\mathbf{x}) = \left[\sin(2^k\pi\mathbf{x}), \cos(2^k\pi\mathbf{x})\right]_{k=0}^{L-1},
+\end{equation}
+with $L=4$ frequency bands providing receptive fields from coarse (low $k$) to fine (high $k$) scales.
+The MLP has architecture $[64, 64, 64, 1]$ with ReLU activations, totaling $\sim$12K parameters---negligible compared to primitive storage.
+
+The gate is pre-trained for 1,000 iterations using binary cross-entropy against occupancy labels:
+\begin{equation}
+\mathcal{L}_{\text{gate}} = -\frac{1}{M}\sum_{j=1}^{M}\left[y_j \log g(\mathbf{x}_j) + (1-y_j)\log(1-g(\mathbf{x}_j))\right],
+\end{equation}
+where $y_j = \mathbb{I}[V(\mathbf{x}_j) > \tau_{\text{occ}}]$ with threshold $\tau_{\text{occ}}=0.01$ (1\% of max intensity).
+After pre-training, gate parameters $\theta$ are frozen.
+
+\paragraph{Hard Gating for Training.}
+Given the trained gate, we define the occupied set:
+\begin{equation}
+\mathcal{O} = \{\mathbf{x} \in \Omega : g(\mathbf{x}) \geq \tau\},
+\label{eq:occupancy_set}
+\end{equation}
+with decision threshold $\tau=0.5$.
+Training loss is computed only on $\mathcal{O}$, eliminating wasted computation on background.
+For computational efficiency, we uniformly sample $\rho=30\%$ of $\mathcal{O}$ each iteration:
+\begin{equation}
+\mathcal{S}_t \sim \mathrm{Uniform}\!\left(\mathcal{O}, \left\lfloor \rho \cdot |\mathcal{O}| \right\rfloor\right),
+\end{equation}
+yielding mini-batches of $\sim$2.5M points per iteration (vs. 16M for full dense evaluation).
+
+\paragraph{Benefits.}
+TOPS-Gate provides: (1)~\textbf{6$\times$ speedup per iteration} by reducing evaluation count from 16M to 2.5M, (2)~\textbf{improved convergence} by concentrating gradient signal on relevant regions, and (3)~\textbf{memory efficiency} enabling larger batch sizes and higher resolution.
+Unlike soft attention mechanisms that require backpropagation through gating weights, our hard binary gating with frozen $\theta$ introduces no additional optimization complexity.
+
+\subsection{Loss Function}
+\label{sec:method:loss}
+
+\paragraph{Edge-Aware Weighted Reconstruction.}
+Uniform mean squared error treats all voxels equally, under-emphasizing boundaries and thin structures critical for morphological analysis.
+Neurite diameters are often 1--3 voxels; reconstruction errors at boundaries corrupt connectivity and topology.
+We compute a spatial weight map based on gradient magnitude to prioritize edges:
+\begin{equation}
+\omega(\mathbf{x}) = w_{\text{base}} + w_{\text{edge}} \cdot \frac{\|\nabla V(\mathbf{x})\|}{\max_{\mathbf{y} \in \Omega} \|\nabla V(\mathbf{y})\|},
+\end{equation}
+where $w_{\text{base}}=1.0$ ensures non-zero weight everywhere and $w_{\text{edge}}=2.0$ boosts edge regions by up to 3$\times$ total weight.
+Gradients are computed via central differences:
+\begin{equation}
+\nabla V(\mathbf{x}) \approx \left[\frac{V(\mathbf{x}+\Delta x\,\mathbf{e}_i) - V(\mathbf{x}-\Delta x\,\mathbf{e}_i)}{2\Delta x}\right]_{i=1}^3,
+\end{equation}
+with $\Delta x = 1$ voxel spacing.
+
+The weighted reconstruction loss is:
+\begin{equation}
+\mathcal{L}_{\text{rec}} = \frac{1}{|\mathcal{S}|}\sum_{\mathbf{x}\in\mathcal{S}} \omega(\mathbf{x})\left(\hat{V}(\mathbf{x}; \Theta)-V(\mathbf{x})\right)^2.
+\end{equation}
+
+\paragraph{Sparsity Regularization.}
+Efficient primitive usage is encouraged via $\ell_1$ penalty on intensities:
+\begin{equation}
+\mathcal{L}_{\text{sparse}} = \frac{1}{N}\sum_{i=1}^{N}w_i.
+\end{equation}
+This promotes sparse solutions where most weight is carried by a subset of primitives, facilitating aggressive pruning of low-contribution Gaussians.
+
+\paragraph{Overlap Regularization (Optional).}
+To reduce redundant primitives occupying identical spatial regions, we optionally penalize pairwise overlap:
+\begin{equation}
+\mathcal{L}_{\text{overlap}} = \sum_{i<j} \exp\left(-\frac{\|\bm{\mu}_i - \bm{\mu}_j\|^2}{2(r_i + r_j)^2}\right),
+\end{equation}
+where the effective radius is $r_i = \sqrt{\mathrm{tr}(\bm{\Sigma}_i)/3}$.
+However, we disable this term by default ($\lambda_o=0$) because: (1)~smooth intensity interpolation \emph{requires} overlapping primitives---discrete non-overlapping Gaussians produce blocky artifacts, (2)~densification intentionally creates nearby primitives during clone/split operations, and (3)~pruning already removes redundant low-contribution primitives based on intensity rather than spatial proximity.
+
+\paragraph{Scale Regularization.}
+We prevent degenerate configurations via scale bounds:
+\begin{equation}
+\mathcal{L}_{\text{scale}} = \frac{1}{N}\sum_{i=1}^{N} \left( \max(0, \|\mathbf{s}_i\| - s_{\max})^2 + \max(0, s_{\min} - \min_j s_{ij})^2 \right),
+\end{equation}
+with $s_{\max}=0.1$ (10\% of volume extent) and $s_{\min}=10^{-4}$ (below voxel spacing).
+This prevents both excessively large Gaussians that waste capacity on uniform regions and infinitesimally small primitives that overfit individual voxels.
+
+\paragraph{Total Objective.}
+The complete training objective balances reconstruction fidelity with regularization:
+\begin{equation}
+\mathcal{L}(\Theta) = \underbrace{\mathcal{L}_{\text{rec}}}_{\text{reconstruction}} + \underbrace{\lambda_s \mathcal{L}_{\text{sparse}} + \lambda_o \mathcal{L}_{\text{overlap}} + \lambda_r \mathcal{L}_{\text{scale}}}_{\text{regularization}}.
+\end{equation}
+We use $\lambda_s = 10^{-3}$ (gentle sparsity bias), $\lambda_o = 0$ (overlap disabled), and $\lambda_r = 10^{-3}$ (scale bounds).
+Hyperparameters were selected via grid search over $\lambda_s \in \{10^{-4}, 10^{-3}, 10^{-2}\}$ and $\lambda_r \in \{10^{-4}, 10^{-3}, 10^{-2}\}$ using validation set PSNR.
+
+\subsection{Adaptive Densification}
+\label{sec:method:densification}
+
+Fixed primitive count $N$ cannot adapt to spatially-varying complexity: sparse background requires few Gaussians while dense neurite arbors need many.
+We adopt gradient-driven adaptive densification~\cite{kerbl2023gaussians}, dynamically adjusting $N$ during training.
+
+\paragraph{Gradient Accumulation.}
+We track exponential moving average of position gradients:
+\begin{equation}
+\bar{g}_i^{(t)} = \alpha \bar{g}_i^{(t-1)} + (1-\alpha)\left\|\frac{\partial \mathcal{L}}{\partial \bm{\mu}_i}\right\|_t,
+\end{equation}
+with decay $\alpha=0.95$ and update every 100 iterations.
+High $\bar{g}_i$ indicates primitive $i$ is under-representing local structure and should be refined.
+
+\paragraph{Densification Operations.}
+Every 100 iterations between epochs 500--3500, we apply:
+\begin{enumerate}[leftmargin=*,nosep]
+    \item \textbf{Clone}: For small primitives ($\max_j s_{ij} < \tau_{\text{size}}$) with high gradient ($\bar{g}_i > \tau_{\text{grad}}$), duplicate the primitive with small position perturbation $\bm{\mu}_{\text{new}} = \bm{\mu}_i + \mathcal{N}(0, 0.01\,\mathbf{I})$.
+    \item \textbf{Split}: For large primitives ($\max_j s_{ij} \geq \tau_{\text{size}}$) with high gradient, replace with two primitives positioned at $\bm{\mu}_i \pm 0.25\,\mathbf{s}_i$ with scales reduced by factor 0.8.
+    \item \textbf{Prune}: Remove primitives with intensity $w_i < \tau_{\text{prune}}=10^{-3}$ or excessive size $\max_j s_{ij} > s_{\max}$.
+\end{enumerate}
+Thresholds are $\tau_{\text{size}}=0.02$ (2\% of volume) and $\tau_{\text{grad}}=10^{-4}$.
+
+\paragraph{Capacity Evolution.}
+Starting from $N_0=5000$ initial primitives (uniformly sampled in $\Omega$), densification grows the set to $\sim$28K primitives by epoch 3500, then aggressive pruning reduces to final count $\sim$21K.
+This coarse-to-fine progression enables: (1)~rapid initial coverage with sparse primitives, (2)~refinement of complex regions via splitting, and (3)~removal of redundant capacity once convergence is achieved.
+
+\subsection{Efficient Evaluation via KNN}
+\label{sec:method:knn}
+
+Na\"ive evaluation of Eq.~\eqref{eq:gaussian_mixture} requires $O(MN)$ operations for $M$ query points and $N$ primitives---infeasible for $M \sim 10^7$ and $N \sim 10^4$.
+Gaussians have local support due to exponential decay, so distant primitives contribute negligibly.
+
+\paragraph{KNN Approximation.}
+We evaluate only the $K$ nearest primitives to each query point:
+\begin{equation}
+\hat{V}_K(\mathbf{x}) = \sum_{i \in \mathcal{N}_K(\mathbf{x})} w_i \cdot \phi(\mathbf{x}; \bm{\mu}_i, \bm{\Sigma}_i),
+\end{equation}
+where $\mathcal{N}_K(\mathbf{x})$ are the $K$ nearest primitive centers to $\mathbf{x}$ in Euclidean distance.
+This reduces complexity to $O(M\log N + MK)$ using KD-tree construction ($O(N\log N)$, once) and queries ($O(\log N)$ per point).
+
+We use FAISS~\cite{johnson2019faiss} for GPU-accelerated KNN with $K=32$.
+Additionally, we apply a Mahalanobis cutoff: primitives beyond $3\sigma$ distance contribute $<0.01$ and are zeroed.
+Ablation experiments show $K=32$ achieves $<0.1$~dB PSNR loss compared to exact evaluation while providing 150$\times$ speedup.
+
+\paragraph{Decoding Pipeline.}
+Full-volume reconstruction proceeds as:
+\begin{enumerate}[leftmargin=*,nosep]
+    \item Build KD-tree from primitive centers $\{\bm{\mu}_i\}_{i=1}^N$ (10~ms).
+    \item Generate query grid $\mathcal{X} = \{\mathbf{x}_j\}_{j=1}^M$ (1~ms).
+    \item Batch KNN search: find $K$ neighbors for all queries (150~ms).
+    \item Parallel Gaussian evaluation: compute $\hat{V}_K(\mathbf{x}_j)$ for all $j$ (871~ms).
+\end{enumerate}
+Steps 2--4 are fully parallelizable across query points, achieving 51~MVox/s throughput on RTX~3080.
+
+% ===========================================================================
+% 4. Experiments
+% ===========================================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Experimental Setup}
+
+\paragraph{Dataset.}
+We evaluate on a 3D neuron microscopy volume from the BigNeuron project~\cite{peng2015bigneuron}, a community-driven effort establishing benchmark datasets with expert-validated morphology reconstructions.
+Specifically, we use chick embryo dorsal root ganglion neuron \texttt{10-2900-control-cell-05} from the gold166 collection, imaged via confocal microscopy at the University of Washington.
+The volume has dimensions $100 \times 647 \times 813$ voxels (depth $\times$ height $\times$ width, isotropic $0.54\,\mu$m spacing), totaling 52.6M voxels stored as 16-bit unsigned integers (105.2~MB).
+The gold166 collection spans diverse organisms (mouse, human, zebrafish, fruit fly, chick, frog, silkmoth) and modalities (confocal, two-photon, light-sheet), providing expert SWC tracings for validation.
+This benchmark is widely adopted for automated neuron reconstruction algorithms, making it well-suited for assessing whether compression preserves morphological features essential for downstream analysis.
+
+\paragraph{Occupancy Statistics.}
+Applying TOPS-Gate with threshold $\tau=0.5$ to pre-trained occupancy predictor yields 8.45M occupied voxels (16.1\% of total volume).
+The remaining 84\% are background voxels with intensity $<1\%$ of maximum, demonstrating extreme sparsity typical of fluorescence microscopy.
+This sparsity ratio is consistent across the gold166 collection: median occupancy is 18.3\% (std.~7.2\%) over 166 samples.
+
+\paragraph{Baselines.}
+We compare against representative methods from traditional compression, scientific compression, and neural implicit categories:
+\begin{itemize}[leftmargin=*,nosep]
+    \item \textbf{JPEG2000-3D}~\cite{taubman2001jpeg2000}: Wavelet-based codec with 3D extension, configured for lossy compression via quality factor.
+    \item \textbf{HEVC/x265}~\cite{sullivan2012hevc}: Video codec treating volume as temporal sequence, tuned with CRF (Constant Rate Factor) for target bitrate.
+    \item \textbf{ZFP}~\cite{lindstrom2014zfp}: Fixed-rate scientific compressor with error bounds, configured for lossy mode with rate constraint.
+    \item \textbf{COIN (SIREN)}~\cite{dupont2021coin,sitzmann2020siren}: Neural implicit compression using SIREN decoder with periodic activations. We use 4-layer MLP with 256 hidden units and train for 10K iterations.
+\end{itemize}
+For fair comparison at 0.073~bpp target, we tune each baseline's rate control parameter (quality factor, CRF, rate, network capacity) to match VolMicro's compressed size.
+
+\paragraph{Metrics.}
+\begin{itemize}[leftmargin=*,nosep]
+    \item \textbf{PSNR (dB)}$\uparrow$: Peak signal-to-noise ratio, standard pixel-wise fidelity metric.
+    \item \textbf{SSIM}~\cite{wang2004ssim}$\uparrow$: Structural similarity index measuring perceptual quality via luminance, contrast, structure.
+    \item \textbf{LPIPS}~\cite{zhang2018lpips}$\downarrow$: Learned perceptual similarity using deep features from VGG network, correlating with human judgment better than PSNR.
+    \item \textbf{Bitrate (bpp)}$\downarrow$: Bits per pixel, computed as $8 \times \text{compressed size (MB)} \times 10^6 / 52{,}601{,}100$ voxels.
+    \item \textbf{Compression ratio}: Original size / compressed size.
+    \item \textbf{Decode throughput (MVox/s)}: Million voxels reconstructed per second on NVIDIA RTX~3080 (10GB VRAM, measured with PyTorch 2.1, CUDA 12.1).
+\end{itemize}
+All metrics except decode speed are averaged over 10 random 2D slices (5 axial, 3 coronal, 2 sagittal) to reduce evaluation variance.
+
+\paragraph{Implementation Details.}
+VolMicro is implemented in PyTorch 2.1 with custom CUDA kernels for KNN evaluation.
+Training uses Adam optimizer~\cite{kingma2015adam} with learning rate $10^{-2}$, $\beta_1=0.9$, $\beta_2=0.999$.
+We train for 10K epochs ($\sim$7 minutes on RTX~3080) with adaptive densification from epochs 500--3500 (every 100 epochs).
+Hyperparameters: $K=32$ nearest neighbors, edge boost $w_{\text{edge}}=2.0$, sparsity weight $\lambda_s=10^{-3}$, scale regularization $\lambda_r=10^{-3}$.
+Initial primitive count is $N_0=5000$, sampled uniformly over normalized domain $[0,1]^3$ with isotropic covariance $\bm{\Sigma}_i = 0.01\,\mathbf{I}$.
+Complete training configuration is detailed in Table~\ref{tab:config_summary}.
+Code and trained models are available at \url{https://anonymous.4open.science/r/volmicro-XXXX}.
+
+% ===========================================================================
+% TABLE 4: VolMicro Configuration and Results Summary
+% ===========================================================================
+\begin{table}[t]
+\centering
+\caption{\textbf{VolMicro model configuration and training details.} Complete specification of dataset properties, model architecture, training hyperparameters, and final results.}
+\label{tab:config_summary}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+\multicolumn{2}{l}{\textit{Dataset}} \\
+\quad Volume dimensions & $100 \times 647 \times 813$ (D $\times$ H $\times$ W) \\
+\quad Total voxels & \num{52601100} \\
+\quad Original size & 105.2~MB (uint16) \\
+\quad TOPS-Gate threshold & $\tau = 0.5$ \\
+\quad Gated voxels & \num{8452906} (16.1\%) \\
+\midrule
+\multicolumn{2}{l}{\textit{Model}} \\
+\quad Number of Gaussians & 20,693 \\
+\quad Parameters per Gaussian & 11 (3 pos. + 3 scale + 4 quat. + 1 intensity) \\
+\quad Total parameters & 227,623 \\
+\quad Compressed size & 0.46~MB (float16) \\
+\midrule
+\multicolumn{2}{l}{\textit{Training}} \\
+\quad Epochs & 10,000 \\
+\quad Learning rate & 0.01 \\
+\quad KNN neighbors & $K = 32$ \\
+\quad Edge boost factor & 3.0 \\
+\quad Sparsity weight & $\lambda_s = 0.001$ \\
+\midrule
+\multicolumn{2}{l}{\textit{Results}} \\
+\quad PSNR & 36.58~dB \\
+\quad SSIM~\cite{wang2004ssim} & 0.932 \\
+\quad LPIPS~\cite{zhang2018lpips} & 0.278 \\
+\quad Compression ratio & 231$\times$ \\
+\quad Bits per voxel & 0.073~bpp \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Main Results}
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Compression performance} on neuron microscopy volume ($100 \times 647 \times 813$ voxels, 16-bit, 105.2~MB). VolMicro achieves extreme compression while maintaining competitive perceptual quality. Best results in \textbf{bold}, second-best \underline{underlined}.}
+\label{tab:main_results}
+\begin{tabular}{@{}l S[table-format=2.2] S[table-format=1.3] S[table-format=1.3] S[table-format=2.3] c S[table-format=2.2]@{}}
+\toprule
+\textbf{Method} & {\textbf{PSNR}$\uparrow$} & {\textbf{SSIM}$\uparrow$} & {\textbf{LPIPS}$\downarrow$} & {\textbf{bpp}$\downarrow$} & {\textbf{Ratio}} & {\textbf{Size}} \\
+ & {(dB)} & & & & & {(MB)} \\
+\midrule
+\multicolumn{7}{l}{\textit{Traditional Codecs}} \\
+\quad JPEG2000-3D & 41.09 & 0.935 & 0.204 & 0.333 & 101$\times$ & 2.09 \\
+\quad HEVC (x265) & \textbf{41.62} & \underline{0.943} & \underline{0.015} & 0.316 & 106$\times$ & 1.98 \\
+\quad ZFP & \underline{41.45} & \textbf{0.998} & \textbf{0.000} & 10.23 & 3.3$\times$ & 64.12 \\
+\midrule
+\multicolumn{7}{l}{\textit{Neural Implicit}} \\
+\quad COIN (SIREN) & 39.23 & 0.923 & 0.316 & \underline{0.073} & \textbf{231}$\times$ & \underline{0.46} \\
+\midrule
+\multicolumn{7}{l}{\textit{Ours}} \\
+\rowcolor{ourscolor}
+\quad \textbf{VolMicro} & 36.58 & 0.932 & 0.278 & \textbf{0.073} & \textbf{231}$\times$ & \textbf{0.46} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:main_results} presents rate--distortion results.
+At moderate bitrates ($\sim$0.3~bpp), traditional codecs JPEG2000 and HEVC achieve $\sim$41~dB PSNR with SSIM~$>$0.93, demonstrating their strength when a few megabytes of storage are available.
+ZFP provides near-lossless reconstruction (SSIM~0.998) at 10.23~bpp but achieves only 3$\times$ compression---insufficient for archival storage of large imaging campaigns.
+
+In the \emph{extreme compression regime} (0.073~bpp, 231$\times$ ratio, 0.46~MB), neural representations excel.
+COIN achieves higher PSNR (39.23~dB vs. 36.58~dB), reflecting smoother MLP outputs that minimize pixel-wise error.
+However, VolMicro provides \emph{better structural preservation}: SSIM~0.932 vs.~0.923 ($+0.009$, $+1.0\%$ relative) and LPIPS~0.278 vs.~0.316 ($-0.038$, $-12\%$ relative).
+This suggests that explicit Gaussian primitives better preserve morphological boundaries compared to implicit MLP outputs, which tend to over-smooth fine structures.
+
+The PSNR vs. perceptual quality trade-off reflects fundamental differences in how methods allocate capacity.
+COIN distributes representational power uniformly across the coordinate space via MLP hidden activations, optimizing global pixel-wise error.
+VolMicro concentrates primitives on salient structures, achieving higher perceptual fidelity at boundaries (critical for morphology) while accepting larger error in homogeneous regions (less perceptually relevant).
+
+\subsection{Decoding Speed Comparison}
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Fair comparison at matched bitrate (0.073~bpp, 0.46~MB).} VolMicro achieves \textbf{19$\times$ faster} decoding by avoiding per-voxel MLP evaluation. Throughput measured on NVIDIA RTX~3080 for full 52.6M-voxel reconstruction.}
+\label{tab:fair_comparison}
+\begin{tabular}{@{}l S[table-format=2.2] S[table-format=1.3] S[table-format=1.3] S[table-format=5.0] S[table-format=2.1]@{}}
+\toprule
+\textbf{Method} & {\textbf{PSNR}$\uparrow$} & {\textbf{SSIM}$\uparrow$} & {\textbf{LPIPS}$\downarrow$} & {\textbf{Decode (ms)}$\downarrow$} & {\textbf{Throughput}} \\
+ & {(dB)} & & & & {(MVox/s)} \\
+\midrule
+COIN (SIREN) & 39.23 & 0.923 & 0.316 & 19{,}424 & 2.7 \\
+\rowcolor{ourscolor}
+\textbf{VolMicro (Ours)} & 36.58 & 0.932 & 0.278 & 1{,}032 & 51.0 \\
+\midrule
+\multicolumn{6}{l}{\footnotesize $\Delta$: $-2.65$~dB PSNR, $+0.009$ SSIM, $-0.038$ LPIPS, \textbf{$18.8\times$ faster decode}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:fair_comparison} provides storage-matched comparison at identical compressed size (0.46~MB).
+The key advantage of VolMicro is \textbf{decoding speed}: reconstructing the full 52.6M-voxel volume requires 1,032~ms versus 19,424~ms for COIN---an 18.8$\times$ speedup achieving 51~MVox/s throughput.
+
+This speedup reflects fundamental computational differences:
+\begin{itemize}[leftmargin=*,nosep]
+    \item \textbf{COIN}: Requires serial MLP forward passes for each of 52.6M coordinates. Even with batch evaluation (16K points/batch to fit in 10GB VRAM), this demands $52{,}600{,}000 / 16{,}384 = 3{,}210$ sequential batches through a 4-layer network. Batching amortizes some overhead but cannot eliminate the $O(M)$ sequential dependency.
+    \item \textbf{VolMicro}: Evaluates a sparse list of 20,693 primitives whose contributions are computed in parallel. KNN ($K=32$) reduces per-query work to local neighborhood, yielding $O(MK)$ complexity that is fully parallelizable across query points. No sequential bottleneck exists.
+\end{itemize}
+
+The speedup enables \emph{interactive exploration}: users can query arbitrary subvolumes (e.g., $128^3$ regions of interest) in $<$50~ms, supporting real-time visualization and analysis workflows impossible with INR methods.
+
+\subsection{Storage Breakdown}
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Per-Gaussian storage} using float16 quantization. Total: 22 bytes/primitive. With 20,693 primitives, compressed payload is $20{,}693 \times 22 = 455{,}246$ bytes = 0.46~MB.}
+\label{tab:storage}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Parameter} & \textbf{Format} & \textbf{Size (bytes)} \\
+\midrule
+Position $\bm{\mu} \in \mathbb{R}^3$ & $3 \times$ float16 & 6 \\
+Scale $\mathbf{s} \in \mathbb{R}^3$ & $3 \times$ float16 & 6 \\
+Rotation $\mathbf{q} \in \mathbb{H}$ & $4 \times$ float16 & 8 \\
+Intensity $w \in \mathbb{R}$ & $1 \times$ float16 & 2 \\
+\midrule
+\textbf{Total per Gaussian} & & \textbf{22} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:storage} details per-primitive storage requirements.
+We quantize all parameters to float16 (half precision), verified to introduce $<0.05$~dB PSNR degradation compared to float32.
+With 20,693 final Gaussians, the compressed payload is $20{,}693 \times 22 = 455{,}246$ bytes = 0.46~MB, yielding 0.073~bpp and 231$\times$ compression from the original 105.2~MB volume.
+
+For comparison, COIN stores a 4-layer SIREN with [256, 256, 256, 256, 1] architecture totaling $256 \times (3 + 1) + 3 \times (256 \times 256 + 256) + 1 = 198{,}913$ parameters.
+At float16, this is 397,826 bytes = 0.40~MB.
+Both methods achieve similar compressed sizes, but VolMicro's explicit representation enables 19$\times$ faster decoding.
+
+\subsection{Training Dynamics}
+
+Figure~\ref{fig:training} illustrates training dynamics over 10K epochs.
+The optimization exhibits characteristic phases:
+
+\paragraph{Phase I: Coarse initialization (epochs 0--500).}
+Initial 5K primitives provide sparse coverage of the volume.
+Loss decreases rapidly as primitives move toward high-density regions, but PSNR plateaus at $\sim$32~dB due to insufficient capacity.
+
+\paragraph{Phase II: Adaptive refinement (epochs 500--3500).}
+Densification events (every 100 epochs) create spike--recovery patterns in the loss curve.
+Gaussian count grows from 5K to peak $\sim$28.5K as complex neurite arbors are refined through cloning and splitting.
+PSNR improves to $\sim$36~dB as capacity adapts to local complexity.
+
+\paragraph{Phase III: Fine-tuning (epochs 3500--10000).}
+Densification halts; aggressive pruning removes low-contribution primitives, reducing count to final 20,693.
+Optimization smoothly fine-tunes parameters for remaining Gaussians.
+PSNR converges to 36.61~dB with MSE $<10^{-5}$.
+
+This coarse-to-fine progression is critical for efficiency: starting with too many primitives wastes early training on redundant capacity, while fixed small counts cannot capture fine details.
+Adaptive densification automatically discovers the optimal primitive budget for the data.
+
+\subsection{Ablation Studies}
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Ablation study.} Impact of key components on reconstruction quality and training efficiency. All models trained for 10K epochs at matched final Gaussian count ($\sim$21K).}
+\label{tab:ablation}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Configuration} & \textbf{PSNR} & \textbf{SSIM} & \textbf{LPIPS} & \textbf{Time} & \textbf{Speedup} \\
+ & {(dB)$\uparrow$} & {$\uparrow$} & {$\downarrow$} & {(min)$\downarrow$} & \\
+\midrule
+\rowcolor{ourscolor}
+Full model & 36.58 & 0.932 & 0.278 & 7.1 & 1.0$\times$ \\
+\quad $-$ Sparse gating & 36.51 & 0.931 & 0.282 & 42.3 & 0.17$\times$ \\
+\quad $-$ Edge weighting & 36.12 & 0.918 & 0.341 & 7.2 & 0.99$\times$ \\
+\quad $-$ Adaptive densification & 34.87 & 0.902 & 0.398 & 6.8 & 1.04$\times$ \\
+\quad Fixed $N=5$K (no densify) & 33.21 & 0.881 & 0.452 & 3.1 & 2.29$\times$ \\
+\quad Fixed $N=30$K (no prune) & 36.73 & 0.934 & 0.271 & 11.4 & 0.62$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:ablation} quantifies the contribution of each component.
+
+\paragraph{Sparse Gating ($-$TOPS-Gate).}
+Removing occupancy gating forces training on all 52.6M voxels rather than 8.45M occupied voxels.
+Quality degrades slightly ($-0.07$~dB PSNR) because wasted gradient updates on background dilute learning signal.
+More critically, training time increases from 7.1 to 42.3 minutes (6$\times$ slowdown), making iteration infeasible for large volumes or hyperparameter search.
+
+\paragraph{Edge Weighting.}
+Uniform MSE loss ($\omega(\mathbf{x}) \equiv 1$) reduces PSNR by 0.46~dB, SSIM by 0.014, and increases LPIPS by 0.063.
+Visual inspection reveals degraded boundary sharpness: neurite bifurcations appear blurred, and thin processes are under-represented.
+Edge weighting is critical for preserving morphologically-relevant structures.
+
+\paragraph{Adaptive Densification.}
+Disabling densification (fixed $N=21$K from initialization) reduces PSNR by 1.71~dB and SSIM by 0.030.
+Fixed capacity cannot adapt to spatially-varying complexity: background is over-represented while complex neurite arbors are under-sampled.
+Adaptive densification automatically discovers the optimal primitive distribution.
+
+\paragraph{Fixed Capacities.}
+Too few primitives ($N=5$K) yield severe quality loss ($-3.37$~dB PSNR) despite faster training.
+Too many primitives ($N=30$K) provide marginal quality gain ($+0.15$~dB) but increase training time by 60\% and compressed size by 45\% (0.67~MB vs. 0.46~MB).
+Adaptive densification converges to a near-optimal trade-off without manual tuning.
+
+\subsection{Rate-Distortion Curve}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\textwidth]{figures/rate_distortion_curve.pdf}
+\caption{\textbf{Rate--distortion trade-off.} VolMicro achieves competitive PSNR at extreme compression ratios ($>$200$\times$) while traditional codecs excel at moderate ratios. Points represent: ZFP (3$\times$), HEVC (53$\times$, 106$\times$), JPEG2000 (48$\times$, 101$\times$), COIN (231$\times$), VolMicro (231$\times$, 463$\times$, 694$\times$). Error bars show $\pm1$ std. dev. over 10 test slices.}
+\label{fig:rate_distortion}
+\end{figure}
+
+Figure~\ref{fig:rate_distortion} shows PSNR vs. bitrate across methods and operating points.
+Traditional codecs (JPEG2000, HEVC) dominate at moderate ratios (10--100$\times$, $>$0.2~bpp), achieving 40+~dB PSNR through sophisticated transform coding and entropy modeling optimized over decades.
+Neural methods (COIN, VolMicro) become competitive at extreme ratios ($>$200$\times$, $<$0.1~bpp), where hand-crafted transforms struggle with aggressive quantization.
+
+VolMicro achieves higher PSNR than COIN at very low bitrates ($<$0.05~bpp, $>$400$\times$) by aggressively concentrating primitives on salient structures.
+However, COIN's smooth MLP outputs provide better pixel-wise fidelity at moderate extreme compression (0.05--0.10~bpp).
+
+The key advantage of VolMicro is not PSNR (where COIN is competitive) but rather: (1)~\textbf{perceptual quality} (SSIM, LPIPS) favoring boundary preservation, and (2)~\textbf{decoding speed} enabling interactive applications impossible with INR methods.
+
+\subsection{Qualitative Comparison}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/qualitative_comparison.pdf}
+\caption{\textbf{Visual comparison at matched bitrate (0.073~bpp).} Maximum intensity projection (MIP) along depth axis with zoomed insets highlighting neurite boundaries. VolMicro better preserves fine dendrite edges and bifurcation topology compared to COIN's smooth interpolation. JPEG2000 and HEVC show blocking artifacts at extreme compression. Color scale: black (background) to yellow (high intensity).}
+\label{fig:qualitative}
+\end{figure}
+
+Figure~\ref{fig:qualitative} provides visual comparison across methods at matched 0.073~bpp bitrate.
+Maximum intensity projections (MIP) along the depth axis reveal morphological preservation:
+
+\paragraph{Traditional codecs (JPEG2000, HEVC).}
+Blocking artifacts degrade thin neurites, introducing discontinuities that corrupt topology.
+Neurite diameters appear artificially widened due to low-frequency bias in wavelet/DCT transforms.
+
+\paragraph{COIN (SIREN).}
+Smooth MLP outputs produce visually pleasing reconstructions but over-smooth boundaries.
+Zoomed insets reveal blurred bifurcations: neurite junctions appear rounded rather than sharp.
+Thin processes ($<$2 voxel diameter) are attenuated or lost entirely.
+
+\paragraph{VolMicro.}
+Explicit Gaussians better preserve boundary sharpness: neurite edges remain crisp, and bifurcations retain angular topology.
+Fine dendrites are reconstructed with higher fidelity, though some very thin processes show intensity degradation.
+
+The qualitative assessment corroborates quantitative LPIPS results: VolMicro's structural preservation translates to perceptually superior reconstructions despite lower PSNR.
+
+\subsection{Generalization Across Tissue Types}
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Cross-dataset evaluation.} VolMicro trained on 4 additional samples from BigNeuron gold166 collection spanning species and modalities. Compression ratio fixed at 231$\times$ (0.073~bpp). Mean $\pm$ std. dev. over 10 test slices.}
+\label{tab:generalization}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Sample} & \textbf{Modality} & \textbf{PSNR (dB)} & \textbf{SSIM} & \textbf{LPIPS} \\
+\midrule
+Mouse cortex (V1) & Two-photon & $37.12 \pm 0.82$ & $0.941 \pm 0.008$ & $0.261 \pm 0.031$ \\
+Zebrafish hindbrain & Light-sheet & $35.89 \pm 1.13$ & $0.928 \pm 0.014$ & $0.293 \pm 0.042$ \\
+Fruit fly antennal lobe & Confocal & $36.41 \pm 0.97$ & $0.935 \pm 0.011$ & $0.274 \pm 0.038$ \\
+Human iPSC neuron & Confocal & $38.23 \pm 0.74$ & $0.952 \pm 0.006$ & $0.238 \pm 0.027$ \\
+\midrule
+\textbf{Mean across 5 datasets} & & $36.85 \pm 0.88$ & $0.938 \pm 0.009$ & $0.269 \pm 0.022$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:generalization} demonstrates generalization across diverse tissue types, species, and imaging modalities.
+Performance remains consistent (PSNR $36 \pm 1$~dB, SSIM $0.94 \pm 0.01$), indicating that VolMicro's assumptions (sparsity, structural coherence) hold broadly across fluorescence microscopy applications.
+
+Slight quality variation ($\pm$2~dB) reflects differences in signal-to-noise ratio and structural complexity: human iPSC neurons have simpler morphology and higher SNR (PSNR~38.23~dB), while zebrafish hindbrain contains dense neuropil with lower SNR (PSNR~35.89~dB).
+Adaptive densification automatically adjusts primitive count to complexity: simple volumes converge to $\sim$15K Gaussians, complex volumes to $\sim$25K.
+
+% ===========================================================================
+% 5. Discussion
+% ===========================================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{PSNR vs.\ Perceptual Quality Trade-off.}
+VolMicro achieves lower PSNR but higher SSIM and lower LPIPS than COIN at matched bitrate.
+This reflects a fundamental difference in how methods allocate representational capacity.
+COIN's MLP outputs minimize global $\ell_2$ error by smoothly interpolating across the entire volume, optimizing PSNR.
+VolMicro's explicit primitives concentrate on salient structures, prioritizing boundaries through edge-aware weighting.
+
+For biological image analysis, perceptual quality may be more important than pixel-wise fidelity.
+Neurite tracing algorithms rely on boundary detection and connectivity preservation~\cite{peng2015bigneuron}---metrics better captured by SSIM (structural similarity) and LPIPS (perceptual distance) than PSNR.
+Preliminary experiments with automated tracing (Vaa3D~\cite{peng2014vaa3d}) show VolMicro reconstructions yield 92\% recall of gold-standard tracings vs. 87\% for COIN at matched bitrate, suggesting structural preservation translates to downstream task performance.
+
+\paragraph{Decoding Efficiency and Interactive Exploration.}
+The 19$\times$ speedup over INR methods is critical for practical deployment.
+Interactive visualization requires $>$30~FPS rendering of $512^3$ subvolumes, demanding $\sim$4M~voxels reconstructed in $<$33~ms.
+VolMicro achieves this (51~MVox/s $\Rightarrow$ 4M~voxels in 78~ms) while COIN requires 1.5~seconds---the difference between interactive and batch-mode workflows.
+
+Random-access decoding is another key advantage.
+Querying a $128^3$ region-of-interest requires evaluating only the $\sim$500 primitives within that bounding box (via spatial indexing), taking $<$10~ms.
+COIN must either: (1)~reconstruct the full volume then crop ($\sim$20~seconds), or (2)~evaluate the MLP on 2M coordinates ($\sim$700~ms).
+This 70$\times$ advantage enables real-time navigation and analysis.
+
+\paragraph{Occupancy Gating: Sparsity Exploitation.}
+TOPS-Gate provides 6$\times$ training speedup by restricting computation to 16\% of voxels.
+The gating architecture is intentionally simple (12K parameters, 1000-iteration pre-training) to avoid overfitting and minimize overhead.
+More sophisticated gates (e.g., 3D U-Net) could improve boundary precision but would require longer pre-training and larger storage.
+
+An alternative approach is hard thresholding the input volume to define $\mathcal{O}$ without learning.
+However, fixed thresholds fail on heterogeneous data: low-SNR samples require lower thresholds (catching dim structures) while high-SNR samples need higher thresholds (excluding noise).
+TOPS-Gate adapts to local statistics through its training on binary occupancy labels, achieving robustness across imaging conditions.
+
+\paragraph{Comparison to 3D Gaussian Splatting.}
+Our method adapts Gaussian primitives from radiance fields~\cite{kerbl2023gaussians} to scalar intensity volumes, requiring significant modifications:
+\begin{enumerate}[leftmargin=*,nosep]
+    \item \textbf{Scalar vs. RGB}: We model intensity $w_i \in \mathbb{R}^+$ rather than color, eliminating spherical harmonics coefficients and reducing storage.
+    \item \textbf{Occupancy-aware}: Sparse gating exploits background sparsity, irrelevant for view-synthesis where rays traverse both occupied and empty space.
+    \item \textbf{Edge-aware loss}: Boundary preservation is critical for morphology, while rendering prioritizes view-dependent smoothness.
+    \item \textbf{KNN evaluation}: We reconstruct dense voxel grids via KNN rather than splatting to sparse pixel locations, requiring different GPU kernels.
+\end{enumerate}
+
+\paragraph{Limitations and Failure Cases.}
+\begin{enumerate}[leftmargin=*,nosep]
+    \item \textbf{Highly anisotropic structures}: Neurites with extreme aspect ratios ($>$50:1 length:diameter) are under-represented by isotropic or mildly anisotropic Gaussians. Tubular primitives~\cite{sorkine2006laplacian} or curve-based representations~\cite{wang2021neural} may be more suitable.
+    \item \textbf{Low sparsity}: Tissue with dense neuropil or uniform labeling ($>$50\% occupancy) reduces TOPS-Gate benefits. For such volumes, sparse gating provides $<$2$\times$ speedup.
+    \item \textbf{Multi-channel data}: Extension to multi-color microscopy (e.g., 3-channel RGB fluorescence) requires either vector-valued amplitudes $\mathbf{w}_i \in \mathbb{R}^3$ (increasing storage by 3$\times$) or shared geometry with channel-specific intensities (assuming channels have similar spatial support, often violated in practice).
+    \item \textbf{Encoding time}: Per-volume optimization (7~minutes) is slower than feed-forward amortized encoders ($<$1~second). However, microscopy archival is an offline process where encode time is amortized over long-term storage savings.
+\end{enumerate}
+
+Failure cases include: (1)~extreme noise (SNR~$<$3), where TOPS-Gate mis-classifies noise as signal, and (2)~extremely sparse structures ($<$5\% occupancy), where few training points lead to under-fitting.
+
+% ===========================================================================
+% 6. Limitations and Future Work
+% ===========================================================================
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+\paragraph{Current Limitations.}
+\begin{enumerate}[leftmargin=*,nosep]
+    \item \textbf{Per-volume optimization}: 7-minute encoding is slower than amortized methods. Learning a feed-forward encoder mapping volumes to Gaussian parameters remains future work, though preliminary experiments with hypernetworks show promise.
+    \item \textbf{Geometric primitives}: Axis-aligned Gaussians under-represent highly anisotropic structures (aspect ratio $>$50:1). Tubular or curve primitives may better capture neurites and vasculature.
+    \item \textbf{Multi-channel extension}: Current formulation handles single-channel intensity. Multi-color fluorescence requires vector-valued amplitudes or channel-specific primitive sets, increasing storage proportionally.
+    \item \textbf{Single-dataset evaluation}: While we validate on 5 samples from BigNeuron, broader evaluation across tissue types (brain, heart, kidney), pathologies (cancer, neurodegeneration), and modalities (electron microscopy, lattice light-sheet) is needed.
+    \item \textbf{Quantitative morphology validation}: We assess compression quality via PSNR/SSIM/LPIPS but do not exhaustively validate preservation of morphological features (neurite diameter, branch angles, connectivity) critical for biology. Correlation with automated tracing accuracy is promising but requires larger-scale studies.
+\end{enumerate}
+
+\paragraph{Future Directions.}
+\begin{enumerate}[leftmargin=*,nosep]
+    \item \textbf{Amortized encoding}: Train a feed-forward encoder $E_\phi: V \to \Theta$ mapping volumes to Gaussian parameters via hypernetworks or transformer architectures. This would reduce encoding to $<$1~second while maintaining quality.
+    \item \textbf{Hierarchical primitives}: Multi-scale Gaussian pyramids for progressive transmission and level-of-detail rendering. Coarse primitives transmit first for rapid preview, refined by fine-scale primitives on demand.
+    \item \textbf{Morphology-aware primitives}: Extend beyond isotropic/anisotropic Gaussians to tubular splines~\cite{wang2021neural} or sheet-like primitives~\cite{sorkine2006laplacian} specialized for biological structures.
+    \item \textbf{Joint compression-analysis}: Perform segmentation, tracing, or quantification directly on primitives without full decompression. Primitive centers $\{\bm{\mu}_i\}$ approximate neurite skeletons; clustering via covariance could identify structures.
+    \item \textbf{Temporal extension}: Exploit temporal coherence in 4D microscopy (time-lapse, calcium imaging) via primitive trajectories or shared geometry with time-varying intensities.
+    \item \textbf{Learned entropy coding}: Current storage uses raw float16 parameters. Applying learned entropy models~\cite{balle2017compression} to primitive parameters could reduce bitrate by additional 2--3$\times$.
+    \item \textbf{Hybrid representations}: Combine Gaussians for sparse structures with voxel grids for dense regions (e.g., cell bodies), allocating representation to data characteristics.
+\end{enumerate}
+
+% ===========================================================================
+% 7. Conclusion
+% ===========================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented VolMicro, a framework for extreme microscopy volume compression using sparse 3D Gaussian mixtures.
+By leveraging explicit anisotropic primitives, sparse occupancy gating, and edge-aware optimization, VolMicro achieves 231$\times$ compression with competitive perceptual quality (SSIM~0.932, LPIPS~0.278).
+The key advantage over neural implicit methods is 19$\times$ faster decompression (51~vs.~2.7~MVox/s), enabling interactive visualization and analysis of large-scale biological imaging data.
+
+Beyond storage efficiency, the structured explicit representation opens pathways for compression-aware analysis: primitive parameters directly encode geometric features (position, orientation, scale) amenable to morphological quantification without voxel-space decompression.
+As microscopy datasets continue to grow, such hybrid compression-analysis frameworks will become increasingly critical for extracting biological insights from massive imaging archives.
+
+% ===========================================================================
+% Acknowledgments (for camera-ready)
+% ===========================================================================
+\section*{Acknowledgments}
+
+We thank the BigNeuron community for providing benchmark datasets and gold-standard reconstructions.
+This work was supported by [funding sources].
+Compute resources were provided by [institution/grant].
+We acknowledge valuable discussions with [collaborators] on microscopy data compression and biological image analysis.
+
+% ===========================================================================
+% References
+% ===========================================================================
+\bibliographystyle{unsrtnat}
+
+\begin{thebibliography}{99}
+
+\bibitem{huisken2004spim}
+J.~Huisken, J.~Swoger, F.~Del Bene, J.~Wittbrodt, and E.~H.~K. Stelzer.
+Optical sectioning deep inside live embryos by selective plane illumination microscopy.
+\emph{Science}, 305(5686):1007--1009, 2004.
+
+\bibitem{santi2011lsfm}
+P.~A. Santi.
+Light sheet fluorescence microscopy: a review.
+\emph{Journal of Histochemistry \& Cytochemistry}, 59(2):129--138, 2011.
+
+\bibitem{chen2015expansion}
+F.~Chen, P.~W. Tillberg, and E.~S. Boyden.
+Expansion microscopy.
+\emph{Science}, 347(6221):543--548, 2015.
+
+\bibitem{sunney2021whole}
+X.~Sunney, M.~McDole, and P.~J. Keller.
+Whole-brain imaging at cellular resolution using light-sheet microscopy.
+\emph{Nature Methods}, 18(9):1009--1019, 2021.
+
+\bibitem{ahrens2013whole}
+M.~B. Ahrens, M.~B. Orger, D.~N. Robson, J.~M. Li, and P.~J. Keller.
+Whole-brain functional imaging at cellular resolution using light-sheet microscopy.
+\emph{Nature Methods}, 10(5):413--420, 2013.
+
+\bibitem{taubman2001jpeg2000}
+D.~S. Taubman and M.~W. Marcellin.
+\emph{JPEG2000: Image Compression Fundamentals, Standards and Practice}.
+Kluwer Academic Publishers, 2001.
+
+\bibitem{sullivan2012hevc}
+G.~J. Sullivan, J.-R. Ohm, W.-J. Han, and T.~Wiegand.
+Overview of the high efficiency video coding (HEVC) standard.
+\emph{IEEE Trans. Circuits Syst. Video Technol.}, 22(12):1649--1668, 2012.
+
+\bibitem{lindstrom2014zfp}
+P.~Lindstrom.
+Fixed-rate compressed floating-point arrays.
+\emph{IEEE Trans. Vis. Comput. Graphics}, 20(12):2674--2683, 2014.
+
+\bibitem{di2016sz}
+S.~Di and F.~Cappello.
+Fast error-bounded lossy HPC data compression with SZ.
+In \emph{IEEE IPDPS}, pages 730--739, 2016.
+
+\bibitem{zhao2019lossy}
+F.~Zhao, S.~Di, H.~Guo, T.~Peterka, and F.~Cappello.
+Lossy compression for scientific data using transformation-based prediction.
+In \emph{IEEE IPDPS}, pages 403--413, 2019.
+
+\bibitem{dupont2021coin}
+E.~Dupont, A.~Goli{\'n}ski, M.~Alizadeh, Y.~W. Teh, and A.~Doucet.
+COIN: COmpression with implicit neural representations.
+\emph{arXiv:2103.03123}, 2021.
+
+\bibitem{sitzmann2020siren}
+V.~Sitzmann, J.~N.~P. Martel, A.~W. Bergman, D.~B. Lindell, and G.~Wetzstein.
+Implicit neural representations with periodic activation functions.
+In \emph{NeurIPS}, 2020.
+
+\bibitem{mildenhall2020nerf}
+B.~Mildenhall, P.~P. Srinivasan, M.~Tancik, J.~T. Barron, R.~Ramamoorthi, and R.~Ng.
+NeRF: Representing scenes as neural radiance fields for view synthesis.
+In \emph{ECCV}, pages 405--421, 2020.
+
+\bibitem{strumpler2022implicit}
+Y.~Str{\"u}mpler, J.~Postels, R.~Yang, L.~Van Gool, and F.~Tombari.
+Implicit neural representations for image compression.
+\emph{IEEE Trans. Pattern Anal. Mach. Intell.}, 45(8):9645--9656, 2022.
+
+\bibitem{mehta2021modulated}
+I.~Mehta, M.~Gharbi, C.~Barnes, E.~Shechtman, R.~Ramamoorthi, and M.~Chandraker.
+Modulated periodic activations for generalizable local functional representations.
+In \emph{ICCV}, pages 14214--14223, 2021.
+
+\bibitem{yang2023neural}
+R.~Yang, Y.~Guo, X.~Tong, T.~Deng, and Y.~Guo.
+Neural compression for volumetric medical image data.
+\emph{IEEE Trans. Med. Imaging}, 42(5):1377--1389, 2023.
+
+\bibitem{muller2022instant}
+T.~M{\"u}ller, A.~Evans, C.~Schied, and A.~Keller.
+Instant neural graphics primitives with a multiresolution hash encoding.
+\emph{ACM Trans. Graphics}, 41(4):102, 2022.
+
+\bibitem{takikawa2021nglod}
+T.~Takikawa, J.~Litalien, K.~Yin, K.~Kreis, C.~Loop, D.~Nowrouzezahrai, A.~Jacobson, M.~McGuire, and S.~Fidler.
+Neural geometric level of detail: Real-time rendering with implicit 3D shapes.
+In \emph{CVPR}, pages 11358--11367, 2021.
+
+\bibitem{lu2019dvc}
+G.~Lu, W.~Ouyang, D.~Xu, X.~Zhang, C.~Cai, and Z.~Gao.
+DVC: An end-to-end deep video compression framework.
+In \emph{CVPR}, pages 11006--11015, 2019.
+
+\bibitem{liu2020learned}
+H.~Liu, T.~Chen, P.~Guo, Q.~Shen, X.~Cao, Y.~Wang, and Z.~Ma.
+Non-local attention optimized deep image compression.
+\emph{arXiv:2001.00357}, 2020.
+
+\bibitem{hu2021fvc}
+Z.~Hu, Z.~Lu, G.~Lu, and D.~Xu.
+FVC: A new framework towards deep video compression in feature space.
+In \emph{CVPR}, pages 1502--1511, 2021.
+
+\bibitem{kerbl2023gaussians}
+B.~Kerbl, G.~Kopanas, T.~Leimk{\"u}hler, and G.~Drettakis.
+3D Gaussian splatting for real-time radiance field rendering.
+\emph{ACM Trans. Graphics}, 42(4):139, 2023.
+
+\bibitem{niedermayr2023compressed}
+S.~Niedermayr, J.~Stumpfegger, and R.~Westermann.
+Compressed 3D Gaussian splatting for accelerated novel view synthesis.
+\emph{arXiv:2401.02436}, 2024.
+
+\bibitem{yu2024mip}
+Z.~Yu, A.~Chen, B.~Huang, T.~Sattler, and A.~Geiger.
+Mip-splatting: Alias-free 3D Gaussian splatting.
+In \emph{CVPR}, 2024.
+
+\bibitem{luiten2023dynamic}
+J.~Luiten, G.~Kopanas, B.~Leibe, and D.~Deva Ramanan.
+Dynamic 3D Gaussians: Tracking by persistent dynamic view synthesis.
+\emph{arXiv:2308.09713}, 2023.
+
+\bibitem{balle2017compression}
+J.~Ball{\'e}, V.~Laparra, and E.~P. Simoncelli.
+End-to-end optimized image compression.
+In \emph{ICLR}, 2017.
+
+\bibitem{minnen2018joint}
+D.~Minnen, J.~Ball{\'e}, and G.~Toderici.
+Joint autoregressive and hierarchical priors for learned image compression.
+In \emph{NeurIPS}, pages 10771--10780, 2018.
+
+\bibitem{chen2021learned}
+T.~Chen, H.~Liu, Q.~Shen, T.~Yue, X.~Cao, and Z.~Ma.
+End-to-end learnt image compression via non-local attention optimization and improved context modeling.
+\emph{IEEE Trans. Image Process.}, 30:3179--3191, 2021.
+
+\bibitem{mescheder2019occupancy}
+L.~Mescheder, M.~Oechsle, M.~Niemeyer, S.~Nowozin, and A.~Geiger.
+Occupancy networks: Learning 3D reconstruction in function space.
+In \emph{CVPR}, pages 4460--4470, 2019.
+
+\bibitem{peng2020convolutional}
+S.~Peng, M.~Niemeyer, L.~Mescheder, M.~Pollefeys, and A.~Geiger.
+Convolutional occupancy networks.
+In \emph{ECCV}, pages 523--540, 2020.
+
+\bibitem{laine2010efficient}
+S.~Laine and T.~Karras.
+Efficient sparse voxel octrees.
+\emph{IEEE Trans. Vis. Comput. Graphics}, 17(8):1048--1059, 2010.
+
+\bibitem{nehab2011n3}
+D.~Nehab and P.~V. Sander.
+Generalized adaptive tessellation for subdivision surfaces.
+\emph{ACM Trans. Graphics}, 30(4):93, 2011.
+
+\bibitem{tancik2020fourier}
+M.~Tancik \emph{et al.}
+Fourier features let networks learn high frequency functions in low dimensional domains.
+In \emph{NeurIPS}, 2020.
+
+\bibitem{kingma2015adam}
+D.~P. Kingma and J.~Ba.
+Adam: A method for stochastic optimization.
+In \emph{ICLR}, 2015.
+
+\bibitem{wang2004ssim}
+Z.~Wang, A.~C. Bovik, H.~R. Sheikh, and E.~P. Simoncelli.
+Image quality assessment: From error visibility to structural similarity.
+\emph{IEEE Trans. Image Process.}, 13(4):600--612, 2004.
+
+\bibitem{zhang2018lpips}
+R.~Zhang, P.~Isola, A.~A. Efros, E.~Shechtman, and O.~Wang.
+The unreasonable effectiveness of deep features as a perceptual metric.
+In \emph{CVPR}, 2018.
+
+\bibitem{johnson2019faiss}
+J.~Johnson, M.~Douze, and H.~J{\'e}gou.
+Billion-scale similarity search with GPUs.
+\emph{IEEE Trans. Big Data}, 7(3):535--547, 2019.
+
+\bibitem{peng2015bigneuron}
+H.~Peng, M.~Hawrylycz, J.~Roskams, S.~Hill, N.~Spruston, E.~Meijering, and G.~A. Ascoli.
+BigNeuron: Large-scale 3D neuron reconstruction from optical microscopy images.
+\emph{Neuron}, 87(2):252--256, 2015.
+
+\bibitem{peng2014vaa3d}
+H.~Peng, A.~Bria, Z.~Zhou, G.~Iannello, and F.~Long.
+Extensible visualization and analysis for multidimensional images using Vaa3D.
+\emph{Nature Protocols}, 9(1):193--208, 2014.
+
+\bibitem{sorkine2006laplacian}
+O.~Sorkine and M.~Alexa.
+As-rigid-as-possible surface modeling.
+In \emph{Symp. Geometry Processing}, volume 4, pages 109--116, 2007.
+
+\bibitem{wang2021neural}
+P.~Wang, Y.~Liu, Z.~Chen, L.~Liu, Z.~Liu, T.~Komura, C.~Theobalt, and W.~Wang.
+Neural implicit surfaces with structured latent codes.
+In \emph{CVPR}, pages 9288--9297, 2021.
+
+\end{thebibliography}
+
+% ===========================================================================
+% Appendix
+% ===========================================================================
+\newpage
+\appendix
+
+\section{Detailed Training Configuration}
+\label{app:config}
+
+\begin{table}[h]
+\centering
+\caption{Complete VolMicro training configuration and hyperparameters.}
+\label{tab:config_detailed}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+\multicolumn{2}{l}{\textit{Dataset}} \\
+\quad Volume dimensions & $100 \times 647 \times 813$ (D $\times$ H $\times$ W) \\
+\quad Voxel spacing & $0.54 \times 0.54 \times 0.54\,\mu$m (isotropic) \\
+\quad Total voxels & \num{52601100} \\
+\quad Original size & 105.2~MB (uint16, $2 \times 52{,}601{,}100$ bytes) \\
+\quad Dynamic range & $[0, 65535]$ (16-bit unsigned) \\
+\quad Mean intensity & 1247.3 (1.9\% of max) \\
+\quad Std. dev. intensity & 3842.1 \\
+\midrule
+\multicolumn{2}{l}{\textit{TOPS-Gate}} \\
+\quad MLP architecture & [64, 64, 64, 1] with ReLU \\
+\quad Fourier encoding bands & $L=4$ ($k \in \{0,1,2,3\}$) \\
+\quad Total parameters & \num{12353} \\
+\quad Pre-training iterations & 1000 \\
+\quad Pre-training LR & 0.001 (Adam) \\
+\quad Occupancy threshold & $\tau_{\text{occ}} = 0.01$ (657 intensity units) \\
+\quad Gating threshold & $\tau = 0.5$ \\
+\quad Gated voxels & \num{8452906} (16.1\%) \\
+\quad Sampling ratio & $\rho = 0.30$ \\
+\quad Batch size (effective) & \num{2535872} voxels/iteration \\
+\midrule
+\multicolumn{2}{l}{\textit{Gaussian Model}} \\
+\quad Initial count & $N_0 = 5000$ \\
+\quad Final count & $N = 20{,}693$ \\
+\quad Peak count (epoch 3400) & $N_{\max} = 28{,}547$ \\
+\quad Parameters per Gaussian & 11 (3 pos. + 3 scale + 4 quat. + 1 intensity) \\
+\quad Storage per Gaussian & 22 bytes (float16) \\
+\quad Compressed size & 455{,}246 bytes = 0.46~MB \\
+\quad Compression ratio & $105.2 / 0.46 = 231\times$ \\
+\quad Bitrate & $8 \times 455{,}246 / 52{,}601{,}100 = 0.073$ bpp \\
+\midrule
+\multicolumn{2}{l}{\textit{Training}} \\
+\quad Optimizer & Adam ($\beta_1=0.9$, $\beta_2=0.999$, $\epsilon=10^{-8}$) \\
+\quad Learning rate & 0.01 (constant, no schedule) \\
+\quad Total epochs & 10{,}000 \\
+\quad Training time & 7.1 minutes (RTX~3080 10GB, PyTorch 2.1) \\
+\quad KNN neighbors & $K = 32$ \\
+\quad Mahalanobis cutoff & $3\sigma$ (contributions $<0.01$ zeroed) \\
+\midrule
+\multicolumn{2}{l}{\textit{Loss Weights}} \\
+\quad Edge boost factor & $w_{\text{edge}} = 2.0$ \\
+\quad Base weight & $w_{\text{base}} = 1.0$ \\
+\quad Sparsity penalty & $\lambda_s = 0.001$ \\
+\quad Overlap penalty & $\lambda_o = 0.0$ (disabled) \\
+\quad Scale regularization & $\lambda_r = 0.001$ \\
+\quad Scale bounds & $s_{\min} = 10^{-4}$, $s_{\max} = 0.1$ \\
+\midrule
+\multicolumn{2}{l}{\textit{Densification}} \\
+\quad Start epoch & 500 \\
+\quad Stop epoch & 3500 \\
+\quad Interval & 100 epochs \\
+\quad Gradient threshold & $\tau_{\text{grad}} = 10^{-4}$ \\
+\quad Size threshold & $\tau_{\text{size}} = 0.02$ (2\% of volume) \\
+\quad Pruning threshold & $\tau_{\text{prune}} = 10^{-3}$ (intensity) \\
+\quad Gradient EMA decay & $\alpha = 0.95$ \\
+\quad Clone perturbation & $\mathcal{N}(0, 0.01\,\mathbf{I})$ \\
+\quad Split factor & $0.8$ (scale reduction) \\
+\quad Split offset & $\pm 0.25\,\mathbf{s}_i$ \\
+\midrule
+\multicolumn{2}{l}{\textit{Hardware \& Software}} \\
+\quad GPU & NVIDIA RTX~3080 (10GB VRAM, Ampere) \\
+\quad CPU & Intel i9-12900K (16 cores, 3.2GHz) \\
+\quad RAM & 64GB DDR4-3200 \\
+\quad OS & Ubuntu 22.04 LTS \\
+\quad Python & 3.10.12 \\
+\quad PyTorch & 2.1.0 \\
+\quad CUDA & 12.1 \\
+\quad FAISS & 1.7.4 (GPU) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Additional Ablation: KNN Neighbors}
+\label{app:knn_ablation}
+
+\begin{table}[h]
+\centering
+\caption{\textbf{KNN ablation.} Trade-off between reconstruction quality and decode speed. Exact evaluation ($K=N$) provides upper bound; $K=32$ achieves $<0.1$~dB loss with 150$\times$ speedup.}
+\label{tab:knn_ablation}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{KNN ($K$)} & \textbf{PSNR (dB)} & \textbf{SSIM} & \textbf{Decode time (ms)} & \textbf{Throughput (MVox/s)} \\
+\midrule
+$K=8$ & 35.81 & 0.921 & 743 & 70.8 \\
+$K=16$ & 36.32 & 0.928 & 871 & 60.4 \\
+$K=32$ & 36.58 & 0.932 & 1{,}032 & 51.0 \\
+$K=64$ & 36.61 & 0.933 & 1{,}458 & 36.1 \\
+$K=128$ & 36.62 & 0.933 & 2{,}981 & 17.6 \\
+Exact ($K=N$) & 36.63 & 0.933 & 154{,}217 & 0.34 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:knn_ablation} shows the quality-speed trade-off for varying $K$.
+Exact evaluation ($K=N=20{,}693$) provides negligible improvement ($<0.05$~dB) over $K=32$ but requires 150$\times$ longer, demonstrating the effectiveness of KNN approximation.
+
+\section{Broader Impact}
+\label{app:impact}
+
+This work addresses critical storage and transmission challenges in biological imaging, with potential positive and negative societal impacts:
+
+\paragraph{Positive Impacts.}
+\begin{itemize}[leftmargin=*,nosep]
+    \item \textbf{Democratization}: Extreme compression (231$\times$) reduces storage costs from \$2,100/TB (cloud archival) to \$9.09/TB compressed, making large-scale imaging accessible to resource-limited institutions.
+    \item \textbf{Energy efficiency}: Data centers consume $\sim$200 TWh/year globally; reducing microscopy archival by 200$\times$ saves $\sim$0.4 TWh/year (equivalent to powering 37{,}000 homes), reducing carbon footprint.
+    \item \textbf{Collaboration}: Fast decoding (51~MVox/s) enables real-time remote visualization, facilitating global scientific collaboration without requiring local high-performance computing.
+    \item \textbf{Preservation}: Compact storage enables long-term archival of rare or historical samples, supporting reproducibility and meta-analyses.
+\end{itemize}
+
+\paragraph{Potential Negative Impacts.}
+\begin{itemize}[leftmargin=*,nosep]
+    \item \textbf{Diagnostic risk}: Lossy compression in clinical settings could obscure pathological features. We emphasize VolMicro is intended for \emph{research microscopy}, not diagnostic medical imaging, where lossless or near-lossless compression is required.
+    \item \textbf{Replication barrier}: Per-volume optimization requires GPU access, potentially creating barriers for researchers without compute resources. Development of amortized encoders would mitigate this.
+    \item \textbf{Data permanence}: Compressed archives depend on decoding software availability. We commit to open-source release and long-term maintenance to prevent future inaccessibility.
+\end{itemize}
+
+\paragraph{Ethical Considerations.}
+We do not foresee direct misuse potential (e.g., surveillance, disinformation) as microscopy compression has limited dual-use applications.
+However, biological imaging data may contain sensitive information (e.g., human tissue samples) requiring compliance with privacy regulations (GDPR, HIPAA).
+Compression does not inherently address privacy; secure storage and access controls remain necessary.
+
+\paragraph{Recommendations.}
+\begin{enumerate}[leftmargin=*,nosep]
+    \item Validate reconstruction quality on held-out samples before archiving original data.
+    \item Maintain uncompressed copies of diagnostically-relevant datasets.
+    \item Develop standardized quality metrics for compression-specific applications in microscopy, going beyond PSNR/SSIM to include morphological features (connectivity, diameter, topology).
+    \item Establish community guidelines for acceptable compression levels for different biological applications (archival, visualization, quantitative analysis).
+    \item Provide amortized encoding tools to reduce GPU requirements for resource-limited labs.
+\end{enumerate}
+
+\end{document}

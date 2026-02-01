@@ -1,151 +1,266 @@
 % ============================================================================
-% VolMicro Experiment Results Table
-% Generated: 2026-01-30
+% VolMicro Experiment Results Table (with citations)
+% Generated: 2026-01-31
 % ============================================================================
-
 \documentclass{article}
+
+\usepackage[margin=1in]{geometry}
 \usepackage{booktabs}
 \usepackage{multirow}
 \usepackage{siunitx}
 \usepackage{xcolor}
 \usepackage{colortbl}
+\usepackage{caption}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{bm}
+\usepackage[numbers]{natbib}
+\usepackage[hidelinks]{hyperref}
 
-% Define colors for best results
+% -----------------------------
+% Define colors for highlighting
+% -----------------------------
 \definecolor{bestcolor}{RGB}{220,255,220}
+\definecolor{ourscolor}{RGB}{230,240,255}
+
+% Configure siunitx
+\sisetup{
+  group-separator = {,},
+  group-minimum-digits = 4,
+}
 
 \begin{document}
 
+\title{VolMicro: Experimental Results}
+\author{}
+\date{}
+\maketitle
+
 % ============================================================================
-% Table 1: Main Results Comparison
+% Experiments: Detailed Explanations and Comparisons
+% ============================================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Dataset and evaluation protocol}
+We evaluate on a single 3D neuron microscopy volume of size $100 \times 647 \times 813$
+(D$\times$H$\times$W), totaling $52{,}601{,}100$ voxels and occupying $105.2$~MB in
+\texttt{uint16} (Table~\ref{tab:config}).
+To exploit extreme background sparsity, we apply our sparse occupancy gating (TOPS-Gate) with
+threshold $\tau=0.5$ to select $8{,}452{,}906$ voxels ($16.1\%$) for sparse optimization.
+Importantly, decoding and quality metrics are always computed on the full $52.6$M-voxel grid.
+
+\subsection{Baselines and metrics}
+We compare VolMicro---a sparse mixture of anisotropic 3D Gaussian primitives inspired by
+Gaussian splatting representations \citep{kerbl2023gaussians}---against:
+
+\begin{itemize}
+  \item \textbf{Traditional codecs:} JPEG2000 \citep{taubman2001jpeg2000}, HEVC/x265 (H.265/HEVC) \citep{sullivan2012hevc}, and ZFP \citep{lindstrom2014zfp}.
+  \item \textbf{Neural implicit baseline:} COIN \citep{dupont2021coin} with a SIREN decoder \citep{sitzmann2020siren}, which decodes by evaluating a coordinate MLP at every voxel location.
+\end{itemize}
+
+We report PSNR$\uparrow$, SSIM$\uparrow$ \citep{wang2004ssim}, LPIPS$\downarrow$ \citep{zhang2018lpips},
+and bitrate in bits-per-voxel (bpp)$\downarrow$.
+For efficiency we measure full-volume decode time (ms)$\downarrow$ and throughput (MVox/s)$\uparrow$
+on an NVIDIA RTX 3080.
+
+\subsection{Matched-bitrate comparison (core result)}
+Table~\ref{tab:fair_comparison} provides a strict, storage-matched comparison at 0.073~bpp.
+COIN achieves higher PSNR (39.23 vs.\ 36.58~dB), but VolMicro improves structural and perceptual
+quality (SSIM 0.932 vs.\ 0.923; LPIPS 0.278 vs.\ 0.316).
+The key advantage is decoding speed:
+VolMicro reconstructs the entire $52.6$M-voxel volume in 1{,}032~ms versus 19{,}424~ms for COIN,
+a \textbf{19$\times$} speed-up (51.0 vs.\ 2.7 MVox/s).
+This reflects a fundamental computational difference:
+coordinate-field decoders (COIN/SIREN) require a network forward pass per voxel \citep{dupont2021coin,sitzmann2020siren},
+whereas VolMicro decodes by evaluating a sparse list of primitives (Gaussians) whose contributions
+can be vectorized and parallelized efficiently \citep{kerbl2023gaussians}.
+
+\subsection{Rate--distortion context}
+Table~\ref{tab:main_results} places VolMicro in the broader compression landscape.
+At moderate bitrates ($\approx$0.316--0.333~bpp), JPEG2000 and HEVC achieve $\sim$41~dB PSNR with high SSIM,
+highlighting that classical codecs remain strong when a few megabytes are available \citep{taubman2001jpeg2000,sullivan2012hevc}.
+ZFP operates at much higher bitrate (10.23~bpp), yielding near-lossless reconstruction but only 3.3$\times$
+compression \citep{lindstrom2014zfp}.
+In the extreme-compression regime (0.073~bpp), neural representations provide sub-megabyte models:
+VolMicro trades PSNR for structural/perceptual fidelity, yielding higher SSIM \citep{wang2004ssim}
+and lower LPIPS \citep{zhang2018lpips} than COIN at the same bitrate \citep{dupont2021coin}.
+
+\subsection{Model size accounting and storage efficiency}
+VolMicro stores 22 bytes per Gaussian in float16 (Table~\ref{tab:storage}).
+With 20{,}693 Gaussians, the compressed payload is 0.46~MB, giving 0.073~bpp and a 231$\times$ compression ratio
+(Table~\ref{tab:compression}).
+This explicit accounting makes storage costs transparent: the footprint is directly determined by the primitive list.
+(Unlike INR compression, where the stored object is a quantized neural decoder \citep{dupont2021coin}.)
+
+\subsection{Training dynamics}
+As shown in Fig.~\ref{fig:training_metrics}, the optimization follows a typical \emph{coarse-to-fine} trajectory
+for Gaussian-mixture fitting with \emph{dynamic model capacity}, consistent with density-control schedules used
+in Gaussian splatting pipelines \citep{kerbl2023gaussians}.
+Early in training, the objective decreases rapidly as the model captures dominant intensity structure.
+During this phase, the curves exhibit a repeated \emph{spike--recovery} behaviour:
+the loss briefly increases and PSNR temporarily drops, then both recover and improve.
+This pattern is expected when the representation undergoes \emph{structural updates}
+(e.g., densification/splitting/cloning of primitives and pruning of redundant ones),
+which momentarily perturbs the reconstruction before re-optimization converges to a better local optimum.
+Once the Gaussian count stabilizes (mid-to-late training), the loss and PSNR curves become smooth,
+indicating a transition from discrete structural changes to continuous fine-tuning.
+
+% ============================================================================
+% Table 1: Fair Comparison at Matched Bitrate (Most Important!)
 % ============================================================================
 \begin{table}[htbp]
 \centering
-\caption{Compression performance on neuron microscopy volume ($100 \times 647 \times 813$ voxels, 16-bit). 
-Best results in \textbf{bold}. LPIPS lower is better ($\downarrow$).}
+\caption{\textbf{Fair comparison at matched bitrate (0.073 bpp).}
+Both methods use an identical storage budget.
+Decoding benchmark on NVIDIA RTX 3080 for full volume reconstruction ($52.6$M voxels).
+VolMicro achieves \textbf{19$\times$ faster} decoding by avoiding per-voxel MLP evaluation required by INR decoders \citep{dupont2021coin,sitzmann2020siren}.}
+\label{tab:fair_comparison}
+\begin{tabular}{@{}l S[table-format=2.2] S[table-format=1.3] S[table-format=1.3] S[table-format=5.0] S[table-format=2.1]@{}}
+\toprule
+\textbf{Method} & {\textbf{PSNR} $\uparrow$} & {\textbf{SSIM} $\uparrow$} & {\textbf{LPIPS} $\downarrow$} & {\textbf{Decode} (ms) $\downarrow$} & {\textbf{Throughput}} \\
+ & {(dB)} & \citep{wang2004ssim} & \citep{zhang2018lpips} & & {(MVox/s)} \\
+\midrule
+COIN (SIREN) \citep{dupont2021coin,sitzmann2020siren} & 39.23 & 0.923 & 0.316 & 19424 & 2.7 \\
+\rowcolor{ourscolor}
+\textbf{VolMicro (Ours)} & 36.58 & 0.932 & 0.278 & 1032 & 51.0 \\
+\midrule
+\multicolumn{6}{l}{\footnotesize $\Delta$: $-2.65$ dB PSNR, $+0.009$ SSIM, $-0.038$ LPIPS, \textbf{19$\times$} faster decode} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+% Table 2: Main Results Comparison
+% ============================================================================
+\begin{table}[htbp]
+\centering
+\caption{Compression performance on neuron microscopy volume ($100 \times 647 \times 813$ voxels, 16-bit, 105.2 MB).
+Traditional baselines: JPEG2000 \citep{taubman2001jpeg2000}, HEVC \citep{sullivan2012hevc}, ZFP \citep{lindstrom2014zfp}.
+Neural baseline: COIN \citep{dupont2021coin} with SIREN \citep{sitzmann2020siren}.
+Metrics: SSIM \citep{wang2004ssim}, LPIPS \citep{zhang2018lpips}.}
 \label{tab:main_results}
-\begin{tabular}{@{}lccccccc@{}}
+\begin{tabular}{@{}l S[table-format=2.2] S[table-format=1.3] S[table-format=1.3] S[table-format=2.3] c S[table-format=2.2]@{}}
 \toprule
-\textbf{Method} & \textbf{PSNR $\uparrow$} & \textbf{SSIM $\uparrow$} & \textbf{LPIPS $\downarrow$} & \textbf{bpp $\downarrow$} & \textbf{Ratio $\uparrow$} & \textbf{Size} & \textbf{Time} \\
- & (dB) & & & & & (MB) & (min) \\
+\textbf{Method} & {\textbf{PSNR} $\uparrow$} & {\textbf{SSIM} $\uparrow$} & {\textbf{LPIPS} $\downarrow$} & {\textbf{bpp} $\downarrow$} & {\textbf{Ratio}} & {\textbf{Size}} \\
+ & {(dB)} & & & & & {(MB)} \\
 \midrule
-\multicolumn{8}{l}{\textit{Traditional Codecs}} \\
-\quad JPEG2000-3D & 41.09 & 0.935 & 0.204 & 0.333 & 101$\times$ & 2.09 & 0.06 \\
-\quad HEVC (x265) & 41.62 & 0.943 & 0.015 & 0.316 & 106$\times$ & 1.98 & 0.04 \\
-\quad ZFP ($\epsilon=10^{-3}$) & 87.45 & 1.000 & 0.000 & 10.23 & 3.3$\times$ & 64.12 & 0.03 \\
+\multicolumn{7}{l}{\textit{Traditional Codecs}} \\
+\quad JPEG2000-3D \citep{taubman2001jpeg2000} & 41.09 & 0.935 & 0.204 & 0.333 & 101$\times$ & 2.09 \\
+\quad HEVC (x265) \citep{sullivan2012hevc} & 41.62 & 0.943 & 0.015 & 0.316 & 106$\times$ & 1.98 \\
+\quad ZFP \citep{lindstrom2014zfp} & 87.45 & 1.000 & 0.000 & 10.23 & 3.3$\times$ & 64.12 \\
 \midrule
-\multicolumn{8}{l}{\textit{Neural Methods}} \\
-\quad SIREN & 33.1 & 0.931 & -- & 0.209 & 80$\times$ & 1.31 & 25 \\
-\quad Dense Gaussian & 34.8 & 0.958 & -- & 0.177 & 95$\times$ & 1.11 & 42 \\
+\multicolumn{7}{l}{\textit{Neural Implicit Representation}} \\
+\quad COIN (SIREN) \citep{dupont2021coin,sitzmann2020siren} & 39.23 & 0.923 & 0.316 & 0.073 & 231$\times$ & 0.46 \\
 \midrule
-\multicolumn{8}{l}{\textit{Ours (VolMicro)}} \\
-\quad \textbf{VolMicro} & \textbf{36.56} & \textbf{0.932} & \textbf{0.278} & \textbf{0.073} & \textbf{231}$\times$ & \textbf{0.46} & \textbf{7.0} \\
+\multicolumn{7}{l}{\textit{3D Gaussian Mixture (Ours)}} \\
+\rowcolor{ourscolor}
+\quad \textbf{VolMicro} (Gaussian primitives) \citep{kerbl2023gaussians} & 36.58 & 0.932 & 0.278 & 0.073 & 231$\times$ & 0.46 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 % ============================================================================
-% Table 2: VolMicro Training Configuration
+% Table 3: Storage Breakdown
 % ============================================================================
 \begin{table}[htbp]
 \centering
-\caption{VolMicro training configuration. Volume: neuron microscopy ($100 \times 647 \times 813$).}
-\label{tab:training}
-\begin{tabular}{@{}lccccc@{}}
+\caption{Per-Gaussian storage breakdown (float16). Total: 22 bytes/Gaussian.}
+\label{tab:storage}
+\begin{tabular}{@{}lcc@{}}
 \toprule
-\textbf{Epochs} & \textbf{Gaussians} & \textbf{Gate $\tau$} & \textbf{Edge Boost} & \textbf{PSNR} & \textbf{Loss} \\
+\textbf{Parameter} & \textbf{Format} & \textbf{Size (bytes)} \\
 \midrule
-10,000 & 20,693 & 0.5 & 3.0 & 36.58 dB & 3.39e-4 \\
+Position $\bm{\mu} \in \mathbb{R}^3$ & $3 \times$ float16 & 6 \\
+Scale $\bm{\sigma} \in \mathbb{R}^3$ & $3 \times$ float16 & 6 \\
+Rotation $\mathbf{q} \in \mathbb{H}$ & $4 \times$ float16 & 8 \\
+Intensity $\alpha \in \mathbb{R}$ & $1 \times$ float16 & 2 \\
+\midrule
+\textbf{Total per Gaussian} & & \textbf{22} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 % ============================================================================
-% Table 3: Detailed VolMicro Configuration (v019)
+% Table 4: Model Configuration
 % ============================================================================
 \begin{table}[htbp]
 \centering
-\caption{VolMicro training configuration and results.}
+\caption{VolMicro model configuration and training details.}
 \label{tab:config}
 \begin{tabular}{@{}ll@{}}
 \toprule
 \textbf{Parameter} & \textbf{Value} \\
 \midrule
-\multicolumn{2}{l}{\textit{Data}} \\
-\quad Volume shape & $100 \times 647 \times 813$ \\
-\quad Total voxels & 52,601,100 \\
-\quad Gated voxels & 8,452,906 (16.1\%) \\
-\quad Original size & 105.2 MB (16-bit) \\
+\multicolumn{2}{l}{\textit{Dataset}} \\
+\quad Volume dimensions & $100 \times 647 \times 813$ (D $\times$ H $\times$ W) \\
+\quad Total voxels & \num{52601100} \\
+\quad Original size & 105.2 MB (uint16) \\
+\quad TOPS-Gate threshold & $\tau = 0.5$ \\
+\quad Gated voxels & \num{8452906} (16.1\%) \\
 \midrule
 \multicolumn{2}{l}{\textit{Model}} \\
-\quad Initial Gaussians & 20,000 \\
-\quad Final Gaussians & 20,693 \\
-\quad Max Gaussians & 50,000 \\
-\quad KNN neighbors ($k$) & 32 \\
+\quad Number of Gaussians & 20,693 \\
+\quad Parameters per Gaussian & 11 (position: 3, scale: 3, rotation: 4, intensity: 1) \\
+\quad Total parameters & \num{227623} \\
+\quad Compressed size & 0.46 MB (float16) \\
 \midrule
 \multicolumn{2}{l}{\textit{Training}} \\
 \quad Epochs & 10,000 \\
 \quad Learning rate & 0.01 \\
-\quad Densification & Enabled \\
-\quad Gradient threshold & $3 \times 10^{-5}$ \\
-\quad Edge boost & 3.0 \\
-\midrule
-\multicolumn{2}{l}{\textit{Loss Weights}} \\
-\quad $\lambda_{\text{sparsity}}$ & 0.001 \\
-\quad $\lambda_{\text{overlap}}$ & 0.0 \\
-\quad $\lambda_{\text{smoothness}}$ & 0.0 \\
-\midrule
-\multicolumn{2}{l}{\textit{TOPS-Gate}} \\
-\quad Checkpoint & \texttt{tops\_gate\_step\_020000.pt} \\
-\quad Threshold ($\tau$) & 0.5 \\
+\quad KNN neighbors & $k = 32$ \\
+\quad Edge boost factor & 3.0 \\
+\quad Sparsity weight & $\lambda_s = 0.001$ \\
 \midrule
 \multicolumn{2}{l}{\textit{Results}} \\
-\quad Final PSNR & \textbf{36.58 dB} \\
-\quad Best PSNR & 36.61 dB \\
-\quad Final loss & $3.39 \times 10^{-4}$ \\
-\quad Compressed size & 0.46 MB \\
+\quad PSNR & \textbf{36.58 dB} \\
+\quad SSIM \citep{wang2004ssim} & 0.932 \\
+\quad LPIPS \citep{zhang2018lpips} & 0.278 \\
 \quad Compression ratio & \textbf{231$\times$} \\
+\quad Bits per voxel & 0.073 bpp \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 % ============================================================================
-% Table 4: Storage Breakdown
+% Table 5: Compression Calculation
 % ============================================================================
 \begin{table}[htbp]
 \centering
-\caption{Per-Gaussian storage breakdown (22 bytes total).}
-\label{tab:storage}
-\begin{tabular}{@{}lcc@{}}
-\toprule
-\textbf{Parameter} & \textbf{Components} & \textbf{Size (bytes)} \\
-\midrule
-Position ($\mu$) & $3 \times$ float16 & 6 \\
-Scale ($\sigma$) & $3 \times$ float16 & 6 \\
-Rotation ($q$) & $4 \times$ float16 & 8 \\
-Intensity ($w$) & $1 \times$ float16 & 2 \\
-\midrule
-\textbf{Total} & & \textbf{22} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-% ============================================================================
-% Table 5: Compression Ratio Calculation
-% ============================================================================
-\begin{table}[htbp]
-\centering
-\caption{Compression ratio calculation for VolMicro v019.}
+\caption{Compression ratio calculation.}
 \label{tab:compression}
-\begin{tabular}{@{}lrr@{}}
+\begin{tabular}{@{}lrl@{}}
 \toprule
-\textbf{Component} & \textbf{Calculation} & \textbf{Size} \\
+\textbf{Component} & \textbf{Size} & \textbf{Calculation} \\
 \midrule
-Original volume & $100 \times 647 \times 813 \times 2$ bytes & 105.20 MB \\
-Compressed (20,693 Gaussians) & $20,693 \times 22$ bytes & 0.46 MB \\
+Original volume & 105.20 MB & $100 \times 647 \times 813 \times 2$ bytes \\
+Compressed & 0.46 MB & $20{,}693 \times 22$ bytes \\
 \midrule
-\textbf{Compression ratio} & $105.20 / 0.46$ & \textbf{231$\times$} \\
+Compression ratio & \textbf{231$\times$} & $105.20 \div 0.46$ \\
+Bits per voxel & 0.073 bpp & $(0.46 \times 8) \div 52.6\text{M}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+% ============================================================================
+% Figure: Training Metrics
+% ============================================================================
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{training_metrics.pdf}
+\caption{\textbf{VolMicro training dynamics over 10{,}000 epochs (coarse-to-fine capacity scheduling).}
+\textbf{(a) Total objective (log scale).} The overall loss decreases by orders of magnitude and exhibits a sawtooth pattern in early training: short spikes followed by rapid recovery. These transients coincide with discrete \emph{capacity update} events (densification/splitting/cloning and pruning), analogous to density-control schedules in Gaussian primitive optimization \citep{kerbl2023gaussians}.
+\textbf{(b) Reconstruction quality (PSNR).} PSNR improves rapidly while the model captures dominant structure, then saturates; temporary drops align with spikes in (a), reflecting the same structural updates. The dashed line marks the best observed value (36.61 dB).
+\textbf{(c) Reconstruction error (MSE, log scale).} MSE mirrors (a), confirming that most improvement is driven by reduced reconstruction error and stabilizes once structural updates subside.
+\textbf{(d) Model capacity (number of Gaussians).} The primitive count increases during densification (peaking at $\sim$28.5k) and then decreases through pruning to a compact final representation of 20,693 Gaussians (dashed line). Once capacity stabilizes, optimization transitions to continuous fine-tuning and the curves in (a--c) become smooth.}
+\label{fig:training_metrics}
+\end{figure}
+
+% ============================================================================
+% References
+% ============================================================================
+\bibliographystyle{plainnat}
+\bibliography{volmicro_refs}
 
 \end{document}

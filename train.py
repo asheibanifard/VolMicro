@@ -170,25 +170,26 @@ def generate_hard_gate_mask(gate_model: TOPSGate, volume_shape, tau: float = 0.5
 @dataclass
 class SparseTrainerConfig:
     learning_rate: float = 0.01
-    lr_decay: float = 0.05  # Final LR = initial * lr_decay (more aggressive decay for fine-tuning)
-    lr_decay_start: int = 5000  # Start decay after densification stops
-    finetune_lr: float = 0.001  # Lower LR for fine-tuning phase after densification
-    lambda_sparsity: float = 0.00001  # Very low for fine structures
-    lambda_overlap: float = 0.0  # Overlap regularization (0 = disabled)
-    lambda_smoothness: float = 0.0  # Smoothness regularization (0 = disabled)
+    lr_decay: float = 0.1  # Final LR = initial * lr_decay
+    lr_decay_start: int = 2500  # Start decay after densification stops
+    finetune_lr: float = 0.002  # Lower LR for fine-tuning phase
+    lambda_sparsity: float = 0.001  # Sparsity regularization
+    lambda_overlap: float = 0.001  # Overlap regularization
+    lambda_smoothness: float = 0.001  # Smoothness regularization
     smoothness_neighbors: int = 5  # k-NN for smoothness
-    knn_k: int = 80  # More neighbors for higher accuracy (was 48)
-    densify_grad_threshold: float = 0.0005  # Higher = less aggressive densification
-    densify_scale_threshold: float = 0.005  # Clone small (<0.005), split large (>0.005)
-    densify_interval: int = 200  # More frequent densification
-    densify_start: int = 200  # Start earlier
-    densify_stop: int = 5000  # Continue longer for refinement
-    max_gaussians: int = 100000  # More Gaussians for fine structures
-    # Pruning thresholds (aggressive)
-    prune_intensity_threshold: float = 0.02  # Prune if intensity < 2% (sigmoid output)
-    prune_scale_threshold: float = 0.05  # Prune if max scale > 5% of volume (too large)
+    knn_k: int = 32  # Neighbors for overlap computation
+    # Densification thresholds (less aggressive - only top ~10% gradients trigger)
+    densify_grad_threshold: float = 0.0001   # Higher = less aggressive (max observed ~8e-05)
+    densify_scale_threshold: float = 0.001    # Clone small (<), split large (>)
+    densify_interval: int = 500             # Less frequent (every 1000 epochs)
+    densify_start: int = 500                # Start later for stable base
+    densify_stop: int = 5000                 # Allow through most of training
+    max_gaussians: int = 50000               # Cap on number of Gaussians
+    # Pruning thresholds
+    prune_intensity_threshold: float = 0.02  # Prune if sigmoid(intensity) < 3%
+    prune_scale_threshold: float = 0.06      # Prune if max scale > 6% of volume
     # Edge-aware loss settings
-    use_edge_weights: bool = True  # Weight loss higher on edges
+    use_edge_weights: bool = False  # Disabled by default (not in proposal)
     edge_boost: float = 3.0  # How much to boost edge regions
 
 
@@ -325,7 +326,7 @@ class SparseGateGuidedTrainer:
         # Overlap regularization: λ·Σᵢ<ⱼ O(Gᵢ,Gⱼ) (using losses.py)
         overlap_loss = torch.tensor(0.0, device=self.device)
         if self.use_overlap:
-            positions = self.model.positions()
+            positions = self.model.positions
             covariance = self.model.get_covariance_matrices()
             overlap_loss = self.overlap_loss(positions, covariance)
             total_loss = total_loss + overlap_loss
@@ -333,7 +334,7 @@ class SparseGateGuidedTrainer:
         # Smoothness regularization: λ·Σᵢ Σⱼ∈𝒩(i) ||θᵢ-θⱼ||² (using losses.py)
         smoothness_loss = torch.tensor(0.0, device=self.device)
         if self.use_smoothness:
-            positions = self.model.positions()
+            positions = self.model.positions
             log_scales = self.model.log_scales()
             smoothness_loss = self.smoothness_loss(positions, intensities, log_scales)
             total_loss = total_loss + smoothness_loss
@@ -370,7 +371,7 @@ class SparseGateGuidedTrainer:
         # Overlap regularization (computed on all Gaussians, not sampled voxels)
         overlap_loss = torch.tensor(0.0, device=self.device)
         if self.use_overlap:
-            positions = self.model.positions()
+            positions = self.model.positions
             covariance = self.model.get_covariance_matrices()
             overlap_loss = self.overlap_loss(positions, covariance)
             total_loss = total_loss + overlap_loss
@@ -378,7 +379,7 @@ class SparseGateGuidedTrainer:
         # Smoothness regularization (computed on all Gaussians)
         smoothness_loss = torch.tensor(0.0, device=self.device)
         if self.use_smoothness:
-            positions = self.model.positions()
+            positions = self.model.positions
             log_scales = self.model.log_scales()
             smoothness_loss = self.smoothness_loss(positions, intensities, log_scales)
             total_loss = total_loss + smoothness_loss
@@ -699,9 +700,10 @@ class SparseGateGuidedTrainer:
 def main():
     parser = argparse.ArgumentParser(description='Sparse Gate-Guided Gaussian Training')
     parser.add_argument('--volume', type=str, required=True, help='Path to volume TIFF')
-    parser.add_argument('--gate_checkpoint', type=str, required=True, help='Path to TOPS-Gate checkpoint')
+    parser.add_argument('--gate_checkpoint', type=str, default=None, help='Path to TOPS-Gate checkpoint')
+    parser.add_argument('--gate_mask', type=str, default=None, help='Path to pre-computed gate mask TIFF (alternative to gate_checkpoint)')
     parser.add_argument('--gate_tau', type=float, default=0.5, help='Gate threshold')
-    parser.add_argument('--num_gaussians', type=int, default=10000, help='Number of Gaussians')
+    parser.add_argument('--num_gaussians', type=int, default=20000, help='Number of Gaussians')
     parser.add_argument('--epochs', type=int, default=1000, help='Training epochs')
     parser.add_argument('--lr', type=float, default=0.01, help='Learning rate')
     parser.add_argument('--output_dir', type=str, default='output/sparse_gate_gaussian', help='Output directory')
@@ -714,8 +716,8 @@ def main():
     parser.add_argument('--num_samples', type=int, default=0, help='Fixed samples per iteration (0 = use sample_ratio instead)')
     parser.add_argument('--knn_k', type=int, default=32, help='K nearest Gaussians per query (lower=faster, higher=more accurate)')
     parser.add_argument('--lambda_sparsity', type=float, default=0.001, help='Sparsity regularization weight')
-    parser.add_argument('--lambda_overlap', type=float, default=0.0, help='Overlap regularization weight (0=disabled)')
-    parser.add_argument('--lambda_smoothness', type=float, default=0.0, help='Smoothness regularization weight (0=disabled)')
+    parser.add_argument('--lambda_overlap', type=float, default=0.001, help='Overlap regularization weight (0=disabled)')
+    parser.add_argument('--lambda_smoothness', type=float, default=0.001, help='Smoothness regularization weight (0=disabled)')
     parser.add_argument('--smoothness_neighbors', type=int, default=5, help='k-NN for smoothness regularization')
     parser.add_argument('--edge_boost', type=float, default=3.0, help='Edge loss weighting boost (0=disabled)')
     parser.add_argument('--no_edge_weights', action='store_true', help='Disable edge-aware loss weighting')
@@ -763,16 +765,24 @@ def main():
     gt_path = os.path.join(args.output_dir, 'ground_truth.tif')
     tifffile.imwrite(gt_path, volume)
     
-    # Load gate model
-    gate_model = load_tops_gate_model(args.gate_checkpoint, device)
+    # Load gate mask (either from pre-computed file or generate from checkpoint)
+    if args.gate_mask is not None:
+        # Load pre-computed gate mask
+        print(f"\nLoading pre-computed gate mask from {args.gate_mask}...")
+        gate_mask_np = tifffile.imread(args.gate_mask)
+        gate_mask = torch.from_numpy(gate_mask_np > 0).to(device)
+        print(f"  Gate mask shape: {gate_mask.shape}")
+    elif args.gate_checkpoint is not None:
+        # Generate from TOPS-Gate model
+        gate_model = load_tops_gate_model(args.gate_checkpoint, device)
+        gate_mask = generate_hard_gate_mask(gate_model, volume_shape, tau=args.gate_tau, device=device)
+        # Save gate mask
+        tifffile.imwrite(os.path.join(args.output_dir, 'gate_mask.tif'), 
+                         gate_mask.cpu().numpy().astype(np.uint8) * 255)
+    else:
+        raise ValueError("Must provide either --gate_checkpoint or --gate_mask")
     
-    # Generate gate mask
-    gate_mask = generate_hard_gate_mask(gate_model, volume_shape, tau=args.gate_tau, device=device)
     n_gated = int(gate_mask.sum().item())
-    
-    # Save gate mask
-    tifffile.imwrite(os.path.join(args.output_dir, 'gate_mask.tif'), 
-                     gate_mask.cpu().numpy().astype(np.uint8) * 255)
     
     # Initialize Gaussians in gated regions
     gated_indices = torch.nonzero(gate_mask, as_tuple=False)
@@ -848,6 +858,38 @@ def main():
         print(f"  Samples per iter: {num_samples:,} ({args.sample_ratio*100:.0f}% of {n_gated:,} gated voxels)")
     print(f"  Loss weights: sparsity={args.lambda_sparsity}, overlap={args.lambda_overlap}, smoothness={args.lambda_smoothness}")
     
+    # Save initial config (in case training crashes)
+    from datetime import datetime
+    initial_config = {
+        'version': f'v{next_version:03d}',
+        'timestamp': datetime.now().isoformat(),
+        'status': 'training',
+        'args': vars(args),
+        'data': {
+            'volume_shape': list(volume_shape),
+            'total_voxels': int(total_voxels),
+            'gated_voxels': int(n_gated),
+            'gate_occupancy_pct': float(100 * n_gated / total_voxels),
+        },
+        'densification': {
+            'enabled': args.densify,
+            'grad_threshold': config.densify_grad_threshold,
+            'scale_threshold': config.densify_scale_threshold,
+            'interval': config.densify_interval,
+            'start': config.densify_start,
+            'stop': config.densify_stop,
+        },
+        'pruning': {
+            'intensity_threshold': config.prune_intensity_threshold,
+            'scale_threshold': config.prune_scale_threshold,
+        },
+        'sample_ratio': args.sample_ratio,
+        'samples_per_iter': num_samples,
+    }
+    with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
+        json.dump(initial_config, f, indent=2)
+    print(f"  Config saved to {args.output_dir}/config.json")
+    
     history = trainer.train(
         num_epochs=args.epochs,
         use_sampling=args.use_sampling,
@@ -882,6 +924,7 @@ def main():
         'args': {
             'volume': args.volume,
             'gate_checkpoint': args.gate_checkpoint,
+            'gate_mask': args.gate_mask,
             'gate_tau': args.gate_tau,
             'num_gaussians': args.num_gaussians,
             'epochs': args.epochs,

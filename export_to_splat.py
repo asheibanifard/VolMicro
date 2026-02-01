@@ -58,7 +58,8 @@ def load_checkpoint(checkpoint_path: str, device: str = 'cuda'):
 
 
 def export_to_splat(model: CUDAGaussianModel, output_path: str, 
-                    scale_factor: float = 1.0, center_offset: tuple = None):
+                    scale_factor: float = 1.0, center_offset: tuple = None,
+                    opacity_mode: str = 'intensity'):
     """
     Export Gaussian model to .splat binary format.
     
@@ -67,6 +68,11 @@ def export_to_splat(model: CUDAGaussianModel, output_path: str,
         output_path: Path to output .splat file
         scale_factor: Scale positions from [0,1] to world coordinates
         center_offset: (x, y, z) offset to center the model
+        opacity_mode: How to derive opacity from intensity:
+            - 'intensity': opacity = intensity (default)
+            - 'sqrt': opacity = sqrt(intensity) (more visible low values)
+            - 'fixed': opacity = 0.8 for all Gaussians
+            - 'threshold': opacity = 1 if intensity > 0.1 else 0.3
     """
     with torch.no_grad():
         # Get Gaussian parameters
@@ -74,7 +80,21 @@ def export_to_splat(model: CUDAGaussianModel, output_path: str,
         scales = model.scales.cpu().numpy()  # (N, 3)
         rotations = model.rotations.cpu().numpy()  # (N, 4) quaternions
         intensities = model.intensities().cpu().numpy()  # (N,)
-        opacities = model.opacities.cpu().numpy()  # (N,)
+        
+        # Derive opacity from intensity (no separate opacity parameter)
+        if opacity_mode == 'intensity':
+            opacities = intensities  # Direct mapping
+        elif opacity_mode == 'sqrt':
+            opacities = np.sqrt(np.clip(intensities, 0, 1))  # Boost low values
+        elif opacity_mode == 'fixed':
+            opacities = np.ones_like(intensities) * 0.8
+        elif opacity_mode == 'threshold':
+            opacities = np.where(intensities > 0.1, 0.9, 0.3)
+        elif opacity_mode == 'floor':
+            # Intensity-weighted with floor - ensures minimum visibility
+            opacities = np.maximum(0.3, intensities)
+        else:
+            opacities = intensities
     
     N = positions.shape[0]
     print(f"Exporting {N} Gaussians to: {output_path}")
@@ -144,6 +164,9 @@ def main():
                         help='Output .splat file path (default: same name as checkpoint)')
     parser.add_argument('--scale', '-s', type=float, default=2.0,
                         help='Scale factor for positions (default: 2.0)')
+    parser.add_argument('--opacity', type=str, default='floor',
+                        choices=['intensity', 'sqrt', 'fixed', 'threshold', 'floor'],
+                        help='How to derive opacity from intensity (default: floor)')
     parser.add_argument('--device', '-d', type=str, default='cuda',
                         help='Device to use (default: cuda)')
     
@@ -158,7 +181,7 @@ def main():
     model, vol_shape = load_checkpoint(args.checkpoint, args.device)
     
     # Export to .splat
-    export_to_splat(model, args.output, scale_factor=args.scale)
+    export_to_splat(model, args.output, scale_factor=args.scale, opacity_mode=args.opacity)
     
     print(f"\nDone! You can now view the model at:")
     print(f"  1. Copy {args.output} to gsplat.js/examples/vanilla-js/")
